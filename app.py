@@ -1,4 +1,3 @@
-
 import os
 from pathlib import Path
 
@@ -443,6 +442,12 @@ def predict_risk(model, image, age, gender_code, age_mean, age_std):
     return probabilities
 
 
+# =====================================================
+# UPDATED RISK PREDICTION DISPLAY
+# Age/Gender fields removed; prediction runs automatically.
+# IMPORTANT: hidden defaults are used by the existing model.
+# =====================================================
+
 def display_risk_prediction(image):
     st.subheader("📊 Risk Prediction")
 
@@ -457,27 +462,22 @@ def display_risk_prediction(image):
         st.info("Upload or capture a retinal image first.")
         return
 
-    with st.form("risk_prediction_form"):
-        age = st.number_input(
-            "Patient Age (years)",
-            min_value=1, max_value=120, value=50, step=1,
-        )
+    # Avoid repeating the same risk prediction on every Streamlit rerun.
+    image_key = st.session_state.get("current_risk_image_key")
 
-        gender_code = st.selectbox(
-            "Gender code used during training",
-            options=[0, 1],
-            format_func=lambda v: (
-                f"Code {v} — mapping must be verified"
-            ),
-        )
+    if image_key is None:
+        st.info("Select a retinal image to run Risk Prediction.")
+        return
 
-        run_risk = st.form_submit_button(
-            "Run Risk Prediction",
-            type="primary",
-            use_container_width=True,
+    if (
+        st.session_state.get("risk_result_image_key") == image_key
+        and st.session_state.get("risk_result_level") is not None
+    ):
+        st.subheader("Risk Assessment")
+        st.metric(
+            "Risk Level",
+            st.session_state.risk_result_level,
         )
-
-    if not run_risk:
         return
 
     try:
@@ -487,14 +487,19 @@ def display_risk_prediction(image):
                 RISK_MODEL_PATH.stat().st_mtime,
             )
 
-            probs = predict_risk(
-                model, image, age, gender_code,
-                age_mean, age_std,
-            )
+            # Hidden default values for the existing image + clinical model.
+            # These do NOT make this a true image-only prediction.
+            assumed_age = age_mean
+            assumed_gender_code = 0
 
-        # =====================================================
-        # RISK LEVEL DISPLAY - HIGH / MEDIUM / LOW ONLY
-        # =====================================================
+            probs = predict_risk(
+                model,
+                image,
+                assumed_age,
+                assumed_gender_code,
+                age_mean,
+                age_std,
+            )
 
         risk_score = float(probs[1]) * 100
 
@@ -504,6 +509,9 @@ def display_risk_prediction(image):
             risk_level = "Medium"
         else:
             risk_level = "Low"
+
+        st.session_state.risk_result_image_key = image_key
+        st.session_state.risk_result_level = risk_level
 
         st.subheader("Risk Assessment")
         st.metric("Risk Level", risk_level)
@@ -661,6 +669,15 @@ if "retinal_results" not in st.session_state:
 if "last_retinal_image_key" not in st.session_state:
     st.session_state.last_retinal_image_key = None
 
+if "current_risk_image_key" not in st.session_state:
+    st.session_state.current_risk_image_key = None
+
+if "risk_result_image_key" not in st.session_state:
+    st.session_state.risk_result_image_key = None
+
+if "risk_result_level" not in st.session_state:
+    st.session_state.risk_result_level = None
+
 
 # =====================================================
 # SIDEBAR
@@ -678,8 +695,6 @@ for name, (filename, _) in MODEL_FILES.items():
         st.sidebar.error(f"{name}: Missing")
 
 st.sidebar.subheader("Clinical Models")
-
-# Fixed: regular if/else prevents DeltaGenerator text appearing.
 
 if CAD_MODEL_PATH.exists():
     st.sidebar.success("CAD model: Found")
@@ -746,6 +761,16 @@ try:
         image_key = str(hash(raw))
 except Exception as error:
     st.error(f"Could not open retinal image: {error}")
+
+
+# =====================================================
+# UPDATE RISK STATE WHEN IMAGE CHANGES
+# =====================================================
+
+if image_key != st.session_state.current_risk_image_key:
+    st.session_state.current_risk_image_key = image_key
+    st.session_state.risk_result_image_key = None
+    st.session_state.risk_result_level = None
 
 
 # =====================================================
