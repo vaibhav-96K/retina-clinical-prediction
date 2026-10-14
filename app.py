@@ -1,3 +1,4 @@
+
 import os
 from pathlib import Path
 
@@ -24,23 +25,13 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-.stApp {
-    background-color: #f5f8fc;
-}
-h1, h2, h3 {
-    color: #17365d;
-}
+.stApp {background-color:#f5f8fc;}
+h1,h2,h3 {color:#17365d;}
 div[data-testid="stMetric"] {
-    background: white;
-    border: 1px solid #dce5f0;
-    padding: 14px;
-    border-radius: 12px;
-}
-div[data-testid="stFileUploader"],
-div[data-testid="stCameraInput"] {
-    background: white;
-    padding: 10px;
-    border-radius: 12px;
+    background:white;
+    border:1px solid #dce5f0;
+    padding:14px;
+    border-radius:12px;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -67,50 +58,36 @@ MODEL_FILES = {
 }
 
 DISEASE_LABELS = [
-    "Normal",
-    "Diabetes",
-    "Glaucoma",
-    "Cataract",
-    "AMD",
-    "Hypertension",
-    "Myopia",
-    "Other",
+    "Normal", "Diabetes", "Glaucoma", "Cataract",
+    "AMD", "Hypertension", "Myopia", "Other"
 ]
 
 SEX_CLASS_LABELS = ["Female", "Male"]
 DIABETES_THRESHOLD = 0.50
 
-CAD_MODEL_FILE = "cad_heart_disease_model.joblib"
+CAD_MODEL_PATH = MODEL_DIR / "cad_heart_disease_model.joblib"
+CAP_MODEL_PATH = MODEL_DIR / "cap_grade_model.pth"
 
-ADDITIONAL_MODELS = {
-    "Risk Prediction": "risk_prediction_model.pth",
-    "CAP Grade": "cap_grade_model.pth",
-}
+RISK_CANDIDATES = [
+    MODEL_DIR / "risk_prediction_model.pth",
+    PROJECT_DIR / "risk_prediction_model.pth",
+    Path(
+        "/content/drive/MyDrive/retinal and clinical project 1/"
+        "risk_prediction_model.pth"
+    ),
+]
 
-CAD_MODEL_PATH = MODEL_DIR / CAD_MODEL_FILE
-
-# Fallback path used in the earlier Google Drive training setup.
-RISK_DRIVE_PATH = Path(
-    "/content/drive/MyDrive/retinal and clinical project 1/"
-    "risk_prediction_model.pth"
+RISK_MODEL_PATH = next(
+    (p for p in RISK_CANDIDATES if p.exists()),
+    RISK_CANDIDATES[0],
 )
-
-RISK_MODEL_PATH = MODEL_DIR / ADDITIONAL_MODELS["Risk Prediction"]
-
-if not RISK_MODEL_PATH.exists() and RISK_DRIVE_PATH.exists():
-    RISK_MODEL_PATH = RISK_DRIVE_PATH
-
-
-# =====================================================
-# IMAGE TRANSFORM
-# =====================================================
 
 TRANSFORM = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
     transforms.ToTensor(),
     transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225],
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225],
     ),
 ])
 
@@ -125,18 +102,14 @@ def extract_state_dict(checkpoint):
 
     if isinstance(checkpoint, dict):
         for key in (
-            "state_dict",
-            "model_state_dict",
-            "model",
-            "net",
-            "weights",
+            "state_dict", "model_state_dict",
+            "model", "net", "weights"
         ):
             if isinstance(checkpoint.get(key), dict):
                 return checkpoint[key]
 
         if checkpoint and all(
-            torch.is_tensor(value)
-            for value in checkpoint.values()
+            torch.is_tensor(v) for v in checkpoint.values()
         ):
             return checkpoint
 
@@ -158,33 +131,17 @@ def clean_state_dict(state):
     return cleaned
 
 
-def infer_output_size(state, default):
-    for key in (
-        "classifier.1.weight",
-        "classifier.weight",
-        "fc.weight",
-    ):
-        if key in state and state[key].ndim == 2:
-            return int(state[key].shape[0])
-
-    return default
-
-
 # =====================================================
-# EXISTING RETINAL MODEL LOADING
+# RETINAL MODEL LOADER
 # =====================================================
 
 @st.cache_resource(show_spinner=False)
-def load_model(path, task):
+def load_model(path, task, modified_time):
     if not os.path.isfile(path):
-        raise FileNotFoundError(
-            f"Model file missing: {path}"
-        )
+        raise FileNotFoundError(f"Model file missing: {path}")
 
     checkpoint = torch.load(
-        path,
-        map_location="cpu",
-        weights_only=False,
+        path, map_location="cpu", weights_only=False
     )
 
     if isinstance(checkpoint, nn.Module):
@@ -194,17 +151,11 @@ def load_model(path, task):
             extract_state_dict(checkpoint)
         )
 
-        default_outputs = (
+        output_size = (
             8 if task == "multilabel" else 1
         )
 
-        output_size = infer_output_size(
-            state,
-            default_outputs,
-        )
-
         model = models.efficientnet_b0(weights=None)
-
         model.classifier[1] = nn.Linear(
             model.classifier[1].in_features,
             output_size,
@@ -212,186 +163,311 @@ def load_model(path, task):
 
         model.load_state_dict(state, strict=True)
 
-    model.to(DEVICE)
-    model.eval()
-
-    return model
+    return model.to(DEVICE).eval()
 
 
-# =====================================================
-# NEW RISK PREDICTION MODEL
-# Architecture matches the trained model:
-# EfficientNet-B0 + age/gender clinical branch
-# =====================================================
+def run_prediction(model, image, task):
+    x = TRANSFORM(
+        image.convert("RGB")
+    ).unsqueeze(0).to(DEVICE)
 
-class RiskPredictionNet(nn.Module):
-    def __init__(self):
-        super().__init__()
+    with torch.inference_mode():
+        output = model(x)
 
-        self.image_encoder = models.efficientnet_b0(
-            weights=None
+    if isinstance(output, (tuple, list)):
+        output = output[0]
+
+    if isinstance(output, dict):
+        output = output.get(
+            "logits", output.get("output")
         )
 
-        # Replace the original EfficientNet classifier
-        # with an identity layer to obtain image features.
-        self.image_encoder.classifier = nn.Identity()
+    values = output.detach().float().cpu().reshape(-1).numpy()
 
-        self.clinical_encoder = nn.Sequential(
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Model returned invalid values.")
+
+    if task == "regression":
+        return float(values[0])
+
+    if task == "multilabel":
+        if np.all((values >= 0) & (values <= 1)):
+            return values
+        return 1 / (1 + np.exp(-np.clip(values, -50, 50)))
+
+    if len(values) == 1:
+        p = float(
+            1 / (1 + np.exp(-np.clip(values[0], -50, 50)))
+        )
+        return {"Class 0": 1 - p, "Class 1": p}
+
+    exp_values = np.exp(
+        np.clip(values - np.max(values), -50, 50)
+    )
+    probabilities = exp_values / exp_values.sum()
+
+    return {
+        f"Class {i}": float(p)
+        for i, p in enumerate(probabilities)
+    }
+
+
+# =====================================================
+# RETINAL RESULT DISPLAY
+# =====================================================
+
+def display_sex(result):
+    if not isinstance(result, dict) or len(result) != 2:
+        st.error("Sex model did not return two class scores.")
+        return
+
+    idx = int(np.argmax(list(result.values())))
+
+    st.metric(
+        "Predicted Sex (verify mapping)",
+        SEX_CLASS_LABELS[idx],
+    )
+    st.caption(
+        "Confirm Female/Male class order against training labels."
+    )
+
+
+def display_disease(result):
+    scores = np.asarray(result).reshape(-1)
+
+    if len(scores) != 8:
+        st.error(f"Expected 8 outputs, received {len(scores)}.")
+        return
+
+    diabetes_score = float(np.clip(scores[1], 0, 1))
+
+    st.metric(
+        "Diabetes Model Result",
+        "Positive" if diabetes_score >= DIABETES_THRESHOLD
+        else "Negative",
+    )
+    st.write(f"Model score: {diabetes_score:.1%}")
+    st.progress(diabetes_score)
+
+    st.caption(
+        "Experimental result. Verify label order and threshold."
+    )
+
+    with st.expander("All Retinal Disease Scores"):
+        for label, score in zip(DISEASE_LABELS, scores):
+            score = float(np.clip(score, 0, 1))
+            st.write(f"**{label}:** {score:.1%}")
+            st.progress(score)
+
+
+def display_model_result(name, result):
+    st.subheader(name)
+
+    if name == "Retinal Age":
+        st.metric("Estimated Age", f"{float(result):.1f} years")
+
+    elif name == "Retinal Sex":
+        display_sex(result)
+
+    elif name == "Retinal Disease":
+        display_disease(result)
+
+    elif name == "CIMT Estimate":
+        st.metric("Raw CIMT Output", f"{float(result):.4f}")
+        st.caption(
+            "Units and clinical cutoff are not verified."
+        )
+
+
+# =====================================================
+# RISK PREDICTION MODEL
+# =====================================================
+
+class RiskFusionModel(nn.Module):
+    def __init__(
+        self,
+        image_name="backbone",
+        clinical_name="clinical_encoder",
+        head_name="head",
+    ):
+        super().__init__()
+
+        backbone = models.efficientnet_b0(weights=None)
+        backbone.classifier = nn.Identity()
+
+        clinical = nn.Sequential(
             nn.Linear(2, 16),
             nn.ReLU(),
         )
 
-        self.head = nn.Sequential(
-            nn.Linear(1280 + 16, 128),
+        head = nn.Sequential(
+            nn.Linear(1296, 128),
             nn.ReLU(),
             nn.Dropout(p=0.3),
             nn.Linear(128, 2),
         )
 
+        setattr(self, image_name, backbone)
+        setattr(self, clinical_name, clinical)
+        setattr(self, head_name, head)
+
+        self.image_name = image_name
+        self.clinical_name = clinical_name
+        self.head_name = head_name
+
     def forward(self, image, clinical):
-        image_features = self.image_encoder(image)
-        clinical_features = self.clinical_encoder(clinical)
+        image_features = getattr(
+            self, self.image_name
+        )(image)
+
+        clinical_features = getattr(
+            self, self.clinical_name
+        )(clinical)
 
         combined = torch.cat(
-            [image_features, clinical_features],
-            dim=1,
+            [image_features, clinical_features], dim=1
         )
 
-        return self.head(combined)
+        return getattr(self, self.head_name)(combined)
+
+
+DEFAULT_AGE_MEAN = 48.032730404823425
+DEFAULT_AGE_STD = 12.87410690819793
 
 
 @st.cache_resource(show_spinner=False)
 def load_risk_model(path, modified_time):
-    if not os.path.isfile(path):
-        raise FileNotFoundError(
-            f"Risk model not found: {path}"
-        )
-
     checkpoint = torch.load(
-        path,
-        map_location="cpu",
-        weights_only=False,
+        path, map_location="cpu", weights_only=False
     )
 
-    # Support a complete saved model when one is supplied.
     if isinstance(checkpoint, nn.Module):
-        model = checkpoint
-    else:
-        state = clean_state_dict(
-            extract_state_dict(checkpoint)
+        return (
+            checkpoint.to(DEVICE).eval(),
+            DEFAULT_AGE_MEAN,
+            DEFAULT_AGE_STD,
         )
 
-        model = RiskPredictionNet()
-        model.load_state_dict(state, strict=True)
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Invalid risk checkpoint format.")
 
-    model.to(DEVICE)
-    model.eval()
+    state = checkpoint
+    for key in ("model_state_dict", "state_dict", "model"):
+        if isinstance(checkpoint.get(key), dict):
+            state = checkpoint[key]
+            break
 
-    return model
+    state = clean_state_dict(state)
+
+    age_mean = float(
+        checkpoint.get("age_mean", DEFAULT_AGE_MEAN)
+    )
+    age_std = float(
+        checkpoint.get("age_std", DEFAULT_AGE_STD)
+    )
+
+    if age_std <= 0:
+        raise ValueError("Invalid age standard deviation.")
+
+    model = None
+    last_error = None
+
+    for image_name in (
+        "backbone", "image_backbone",
+        "image_model", "image_encoder", "efficientnet"
+    ):
+        for clinical_name in (
+            "clinical_encoder", "clinical_net",
+            "clinical_model", "clinical_mlp"
+        ):
+            for head_name in (
+                "head", "classifier", "risk_head", "fusion_head"
+            ):
+                candidate = RiskFusionModel(
+                    image_name, clinical_name, head_name
+                )
+                try:
+                    candidate.load_state_dict(state, strict=True)
+                    model = candidate
+                    break
+                except Exception as error:
+                    last_error = error
+
+            if model is not None:
+                break
+        if model is not None:
+            break
+
+    if model is None:
+        raise RuntimeError(
+            f"Risk checkpoint architecture mismatch: {last_error}"
+        )
+
+    return model.to(DEVICE).eval(), age_mean, age_std
 
 
-def predict_risk(model, image, age, gender_code):
-    """
-    age and gender_code are passed as the two clinical features.
-
-    IMPORTANT:
-    Use the same image preprocessing, age scaling and gender
-    encoding used during training. This function assumes raw age
-    and a numeric gender code are what the trained model expects.
-    """
-
-    image_tensor = TRANSFORM(
+def predict_risk(model, image, age, gender_code, age_mean, age_std):
+    x = TRANSFORM(
         image.convert("RGB")
     ).unsqueeze(0).to(DEVICE)
 
-    clinical_tensor = torch.tensor(
-        [[float(age), float(gender_code)]],
+    normalized_age = (float(age) - age_mean) / age_std
+
+    clinical = torch.tensor(
+        [[normalized_age, float(gender_code)]],
         dtype=torch.float32,
         device=DEVICE,
     )
 
     with torch.inference_mode():
-        output = model(image_tensor, clinical_tensor)
+        logits = model(x, clinical)
 
-        if isinstance(output, (tuple, list)):
-            output = output[0]
+        if isinstance(logits, (tuple, list)):
+            logits = logits[0]
 
-        if isinstance(output, dict):
-            output = output.get(
-                "logits",
-                output.get("output"),
-            )
+        if isinstance(logits, dict):
+            logits = logits.get("logits", logits.get("output"))
 
-        if output is None:
-            raise ValueError(
-                "Risk model did not return output logits."
-            )
-
-        output = output.float().reshape(1, -1)
-
-        if output.shape[1] != 2:
-            raise ValueError(
-                "Expected 2 output classes from risk model; "
-                f"received {output.shape[1]}."
-            )
+        if logits is None:
+            raise ValueError("Risk model returned no logits.")
 
         probabilities = torch.softmax(
-            output,
-            dim=1,
+            logits.float().reshape(1, -1), dim=1
         )[0].cpu().numpy()
 
-    if not np.all(np.isfinite(probabilities)):
-        raise ValueError(
-            "Risk model returned invalid numeric values."
-        )
+    if len(probabilities) != 2 or not np.all(
+        np.isfinite(probabilities)
+    ):
+        raise ValueError("Risk model returned invalid scores.")
 
     return probabilities
 
 
-def display_risk_prediction():
+def display_risk_prediction(image):
     st.subheader("📊 Risk Prediction")
 
     if not RISK_MODEL_PATH.exists():
         st.info(
-            "Risk model file not found. Place "
-            "'risk_prediction_model.pth' inside the models "
-            "folder or make the configured Drive path available."
+            "Risk model missing. Put risk_prediction_model.pth "
+            "in the models folder or configured Drive path."
         )
         return
 
-    st.caption(
-        "This prediction uses the selected retinal image and "
-        "the clinical inputs below."
-    )
-
-    st.warning(
-        "Before using the result, verify the training label mapping, "
-        "gender encoding, image preprocessing and age scaling. "
-        "The output is an experimental model score, not a diagnosis "
-        "or a validated clinical risk probability."
-    )
-
     if image is None:
-        st.info(
-            "First upload a retinal image or capture one using "
-            "the Retina Camera above."
-        )
+        st.info("Upload or capture a retinal image first.")
         return
 
     with st.form("risk_prediction_form"):
         age = st.number_input(
             "Patient Age (years)",
-            min_value=1,
-            max_value=120,
-            value=50,
-            step=1,
+            min_value=1, max_value=120, value=50, step=1,
         )
 
         gender_code = st.selectbox(
-            "Gender code used by training dataset",
+            "Gender code used during training",
             options=[0, 1],
-            format_func=lambda value: (
-                f"Code {value} — verify against training labels"
+            format_func=lambda v: (
+                f"Code {v} — mapping must be verified"
             ),
         )
 
@@ -405,93 +481,43 @@ def display_risk_prediction():
         return
 
     try:
-        with st.spinner("Running Risk Prediction model..."):
-            model = load_risk_model(
+        with st.spinner("Running Risk Prediction..."):
+            model, age_mean, age_std = load_risk_model(
                 str(RISK_MODEL_PATH),
                 RISK_MODEL_PATH.stat().st_mtime,
             )
 
-            probabilities = predict_risk(
-                model=model,
-                image=image,
-                age=age,
-                gender_code=gender_code,
+            probs = predict_risk(
+                model, image, age, gender_code,
+                age_mean, age_std,
             )
 
-        predicted_class = int(np.argmax(probabilities))
-
-        st.markdown("### Risk Model Output")
-
+        idx = int(np.argmax(probs))
         col1, col2 = st.columns(2)
 
-        with col1:
-            st.metric(
-                "Predicted Dataset Class",
-                f"Class {predicted_class}",
-            )
+        col1.metric("Predicted Dataset Class", f"Class {idx}")
+        col2.metric("Selected Class Score", f"{probs[idx]:.1%}")
 
-        with col2:
-            st.metric(
-                "Selected Class Score",
-                f"{probabilities[predicted_class] * 100:.1f}%",
-            )
+        left, right = st.columns(2)
+        left.write(f"**Class 0:** {probs[0]:.1%}")
+        left.progress(float(np.clip(probs[0], 0, 1)))
+        right.write(f"**Class 1:** {probs[1]:.1%}")
+        right.progress(float(np.clip(probs[1], 0, 1)))
 
-        st.write("Scores for both model classes:")
-
-        for class_index, score in enumerate(probabilities):
-            st.write(
-                f"**Class {class_index}:** {score * 100:.1f}%"
-            )
-            st.progress(float(np.clip(score, 0, 1)))
-
-        st.caption(
-            "Class 0/Class 1 meanings must be confirmed from the "
-            "training dataset. Scores may not be calibrated probabilities."
+        st.warning(
+            "Experimental score only. Confirm class meanings and "
+            "gender encoding. This is not a validated clinical risk."
         )
 
     except Exception as error:
         st.error(
-            f"Risk Prediction failed: {error}"
-        )
-        st.caption(
-            "Check that the checkpoint architecture and clinical "
-            "preprocessing match the training code."
+            f"Risk Prediction failed: {type(error).__name__}: {error}"
         )
 
 
 # =====================================================
-# CAD MODEL LOADING
+# CAD MODEL
 # =====================================================
-
-@st.cache_resource(show_spinner=False)
-def load_cad_model(path, modified_time):
-    artifact = joblib.load(path)
-
-    if not isinstance(artifact, dict):
-        raise ValueError(
-            "CAD artifact must be a dictionary."
-        )
-
-    required_keys = {
-        "model",
-        "feature_columns",
-        "classes",
-    }
-
-    missing = required_keys - set(artifact.keys())
-
-    if missing:
-        raise ValueError(
-            f"CAD artifact is missing keys: {sorted(missing)}"
-        )
-
-    if not artifact["feature_columns"]:
-        raise ValueError(
-            "CAD feature_columns is empty."
-        )
-
-    return artifact
-
 
 CAD_CATEGORICAL_OPTIONS = {
     "sex": [0, 1],
@@ -513,91 +539,21 @@ CAD_NUMERIC_RANGES = {
 }
 
 
-# =====================================================
-# CAD CLINICAL INPUT FORM
-# =====================================================
+@st.cache_resource(show_spinner=False)
+def load_cad_model(path, modified_time):
+    artifact = joblib.load(path)
 
-def render_cad_input(
-    feature_columns,
-    numeric_columns,
-    categorical_columns,
-):
-    values = {}
+    if not isinstance(artifact, dict):
+        raise ValueError("CAD artifact must be a dictionary.")
 
-    st.write(
-        "Enter clinical measurements using the units "
-        "and category codes expected by the training dataset."
-    )
+    missing = {"model", "feature_columns", "classes"} - set(artifact)
+    if missing:
+        raise ValueError(f"CAD artifact missing: {sorted(missing)}")
 
-    st.caption(
-        "Form defaults are examples only. Enter verified "
-        "measurements and the correct category codes."
-    )
+    if not artifact["feature_columns"]:
+        raise ValueError("CAD feature_columns is empty.")
 
-    with st.form("cad_clinical_form"):
-        col1, col2 = st.columns(2)
-
-        for index, feature in enumerate(feature_columns):
-            container = col1 if index % 2 == 0 else col2
-
-            with container:
-                if feature in CAD_CATEGORICAL_OPTIONS:
-                    value = st.selectbox(
-                        f"{feature} (dataset code)",
-                        options=CAD_CATEGORICAL_OPTIONS[feature],
-                        key=f"cad_{feature}",
-                    )
-
-                elif feature in CAD_NUMERIC_RANGES:
-                    minimum, maximum, default = (
-                        CAD_NUMERIC_RANGES[feature]
-                    )
-
-                    value = st.number_input(
-                        feature,
-                        min_value=float(minimum),
-                        max_value=float(maximum),
-                        value=float(default),
-                        step=(
-                            0.1 if feature == "oldpeak"
-                            else 1.0
-                        ),
-                        key=f"cad_{feature}",
-                    )
-
-                elif feature in numeric_columns:
-                    value = st.number_input(
-                        feature,
-                        value=0.0,
-                        key=f"cad_{feature}",
-                    )
-
-                elif feature in categorical_columns:
-                    value = st.text_input(
-                        f"{feature} (category)",
-                        key=f"cad_{feature}",
-                    ).strip()
-
-                    if value == "":
-                        st.warning(
-                            f"Enter a category value for {feature}."
-                        )
-
-                else:
-                    value = st.text_input(
-                        feature,
-                        key=f"cad_{feature}",
-                    ).strip()
-
-            values[feature] = value
-
-        submitted = st.form_submit_button(
-            "Run CAD Prediction",
-            type="primary",
-            use_container_width=True,
-        )
-
-    return submitted, values
+    return artifact
 
 
 def display_cad_prediction():
@@ -605,8 +561,8 @@ def display_cad_prediction():
 
     if not CAD_MODEL_PATH.exists():
         st.info(
-            f"CAD model is not installed. Add "
-            f"models/{CAD_MODEL_FILE} to the repository."
+            "CAD model not installed. Add "
+            "models/cad_heart_disease_model.joblib."
         )
         return
 
@@ -619,272 +575,81 @@ def display_cad_prediction():
         st.error(f"Could not load CAD model: {error}")
         return
 
-    feature_columns = artifact["feature_columns"]
-    numeric_columns = artifact.get("numeric_columns", [])
-    categorical_columns = artifact.get(
-        "categorical_columns", []
-    )
+    features = artifact["feature_columns"]
+    numeric = artifact.get("numeric_columns", [])
+    categorical = artifact.get("categorical_columns", [])
 
-    st.caption(
-        f"Loaded clinical model with "
-        f"{len(feature_columns)} input features."
-    )
+    values = {}
 
-    submitted, values = render_cad_input(
-        feature_columns,
-        numeric_columns,
-        categorical_columns,
-    )
+    with st.form("cad_clinical_form"):
+        col1, col2 = st.columns(2)
+
+        for i, feature in enumerate(features):
+            with (col1 if i % 2 == 0 else col2):
+                if feature in CAD_CATEGORICAL_OPTIONS:
+                    value = st.selectbox(
+                        f"{feature} (dataset code)",
+                        CAD_CATEGORICAL_OPTIONS[feature],
+                        key=f"cad_{feature}",
+                    )
+                elif feature in CAD_NUMERIC_RANGES:
+                    lo, hi, default = CAD_NUMERIC_RANGES[feature]
+                    value = st.number_input(
+                        feature,
+                        min_value=float(lo),
+                        max_value=float(hi),
+                        value=float(default),
+                        step=0.1 if feature == "oldpeak" else 1.0,
+                        key=f"cad_{feature}",
+                    )
+                elif feature in numeric:
+                    value = st.number_input(
+                        feature, value=0.0, key=f"cad_{feature}"
+                    )
+                else:
+                    value = st.text_input(
+                        f"{feature} (category/code)",
+                        key=f"cad_{feature}",
+                    ).strip()
+
+                values[feature] = value
+
+        submitted = st.form_submit_button(
+            "Run CAD Prediction",
+            type="primary",
+            use_container_width=True,
+        )
 
     if not submitted:
-        st.caption(
-            "Complete the form and select Run CAD Prediction."
-        )
         return
 
     try:
         row = pd.DataFrame(
-            [[values[col] for col in feature_columns]],
-            columns=feature_columns,
+            [[values[col] for col in features]],
+            columns=features,
         )
 
-        for col in numeric_columns:
-            row[col] = pd.to_numeric(
-                row[col],
-                errors="raise",
-            )
+        for col in numeric:
+            row[col] = pd.to_numeric(row[col], errors="raise")
 
         model = artifact["model"]
         prediction = int(model.predict(row)[0])
         classes = artifact["classes"]
 
         if prediction < 0 or prediction >= len(classes):
-            raise ValueError(
-                "Prediction does not match saved class mapping."
-            )
+            raise ValueError("Prediction does not match saved class mapping.")
 
-        st.markdown("### Model Output")
-        st.write(
-            f"**Predicted class:** {classes[prediction]}"
-        )
+        st.write(f"**Predicted class:** {classes[prediction]}")
 
         if hasattr(model, "predict_proba"):
-            probabilities = model.predict_proba(row)[0]
+            scores = model.predict_proba(row)[0]
+            for label, score in zip(classes, scores):
+                st.write(f"- {label}: {float(score):.1%}")
 
-            if len(probabilities) == len(classes):
-                st.write("Class scores:")
-
-                for label, score in zip(
-                    classes,
-                    probabilities,
-                ):
-                    st.write(
-                        f"- {label}: {float(score):.1%}"
-                    )
-
-        st.warning(
-            "Research prototype only. These scores are not "
-            "validated clinical probabilities or a diagnosis."
-        )
+        st.warning("Research prototype only; not a diagnosis.")
 
     except Exception as error:
         st.error(f"CAD prediction failed: {error}")
-
-
-# =====================================================
-# RETINAL PREDICTION HELPERS
-# =====================================================
-
-def run_prediction(model, image, task):
-    tensor = TRANSFORM(
-        image.convert("RGB")
-    ).unsqueeze(0).to(DEVICE)
-
-    with torch.inference_mode():
-        output = model(tensor)
-
-    if isinstance(output, (tuple, list)):
-        output = output[0]
-
-    if isinstance(output, dict):
-        if "logits" in output:
-            output = output["logits"]
-        elif "output" in output:
-            output = output["output"]
-        else:
-            output = next(iter(output.values()))
-
-    values = (
-        output.detach()
-        .float()
-        .cpu()
-        .reshape(-1)
-        .numpy()
-    )
-
-    if not np.all(np.isfinite(values)):
-        raise ValueError(
-            "Model returned invalid numeric values."
-        )
-
-    if task == "regression":
-        return float(values[0])
-
-    if task == "multilabel":
-        if np.all((values >= 0) & (values <= 1)):
-            return values
-
-        return 1.0 / (
-            1.0 + np.exp(-np.clip(values, -50, 50))
-        )
-
-    if len(values) == 1:
-        probability = float(
-            1.0 / (
-                1.0 + np.exp(
-                    -np.clip(values[0], -50, 50)
-                )
-            )
-        )
-
-        return {
-            "Class 0": 1.0 - probability,
-            "Class 1": probability,
-        }
-
-    shifted = values - np.max(values)
-    exp_values = np.exp(
-        np.clip(shifted, -50, 50)
-    )
-    probabilities = exp_values / exp_values.sum()
-
-    return {
-        f"Class {index}": float(probability)
-        for index, probability in enumerate(probabilities)
-    }
-
-
-def display_sex(result):
-    if not isinstance(result, dict) or len(result) != 2:
-        st.error(
-            "Sex model did not return two class scores."
-        )
-        return
-
-    scores = list(result.values())
-    predicted_index = int(np.argmax(scores))
-
-    if predicted_index >= len(SEX_CLASS_LABELS):
-        st.error("Sex class mapping is unavailable.")
-        return
-
-    st.metric(
-        "Predicted Sex",
-        SEX_CLASS_LABELS[predicted_index],
-    )
-
-    st.caption(
-        "Confirm Female/Male class order against training labels."
-    )
-
-
-def display_disease(result):
-    scores = np.asarray(result).reshape(-1)
-
-    if len(scores) != len(DISEASE_LABELS):
-        st.error(
-            f"Expected {len(DISEASE_LABELS)} disease outputs; "
-            f"received {len(scores)}."
-        )
-        st.write("Raw outputs:", scores.tolist())
-        return
-
-    diabetes_score = float(
-        np.clip(scores[1], 0, 1)
-    )
-
-    status = (
-        "Positive"
-        if diabetes_score >= DIABETES_THRESHOLD
-        else "Negative"
-    )
-
-    st.metric("Diabetes Model Result", status)
-    st.write(
-        f"Model score: {diabetes_score * 100:.1f}%"
-    )
-    st.progress(diabetes_score)
-
-    st.caption(
-        "Experimental output. Verify label order and threshold "
-        "against the model's training configuration."
-    )
-
-    with st.expander("All Retinal Disease Scores"):
-        for label, score in zip(DISEASE_LABELS, scores):
-            score = float(np.clip(score, 0, 1))
-            st.write(
-                f"**{label}:** {score * 100:.1f}%"
-            )
-            st.progress(score)
-
-
-def display_model_result(name, result):
-    st.subheader(name)
-
-    if name == "Retinal Age":
-        st.metric(
-            "Estimated Age",
-            f"{float(result):.1f} years",
-        )
-
-    elif name == "Retinal Sex":
-        display_sex(result)
-
-    elif name == "Retinal Disease":
-        display_disease(result)
-
-    elif name == "CIMT Estimate":
-        st.metric(
-            "Raw CIMT Model Output",
-            f"{float(result):.4f}",
-        )
-
-        st.caption(
-            "Units have not been verified. Classification "
-            "is disabled until units and a validated cutoff "
-            "are confirmed."
-        )
-
-
-# =====================================================
-# OTHER ADDITIONAL PREDICTIONS
-# =====================================================
-
-def display_other_additional_predictions():
-    cap_col = st.columns(1)[0]
-
-    with cap_col:
-        st.subheader("🔬 CAP Grade")
-
-        cap_path = (
-            MODEL_DIR / ADDITIONAL_MODELS["CAP Grade"]
-        )
-
-        if cap_path.exists():
-            st.warning(
-                f"{cap_path.name} exists, but its model format "
-                "and grade mapping are not configured."
-            )
-        else:
-            st.info(
-                "A compatible trained CAP model and verified "
-                "grade labels are needed."
-            )
-
-        st.caption(
-            "No CAP grade is generated without a compatible model."
-        )
 
 
 # =====================================================
@@ -905,7 +670,6 @@ if "last_retinal_image_key" not in st.session_state:
 st.sidebar.title("👁️ Retina AI")
 st.sidebar.write("Research Prediction Dashboard")
 st.sidebar.caption(f"Device: {DEVICE}")
-
 st.sidebar.subheader("Retinal Models")
 
 for name, (filename, _) in MODEL_FILES.items():
@@ -915,51 +679,26 @@ for name, (filename, _) in MODEL_FILES.items():
         st.sidebar.error(f"{name}: Missing")
 
 st.sidebar.subheader("Clinical Models")
-
-if CAD_MODEL_PATH.exists():
-    st.sidebar.success("CAD model: Found")
-else:
-    st.sidebar.info("CAD model: Not found")
-
-if RISK_MODEL_PATH.exists():
-    st.sidebar.success("Risk Prediction: Found")
-else:
-    st.sidebar.info("Risk Prediction: Not found")
-
-cap_path = MODEL_DIR / ADDITIONAL_MODELS["CAP Grade"]
-
-if cap_path.exists():
-    st.sidebar.success("CAP Grade: File found")
-else:
-    st.sidebar.info("CAP Grade: Not found")
+st.sidebar.success("CAD model: Found") if CAD_MODEL_PATH.exists() else st.sidebar.info("CAD model: Not found")
+st.sidebar.success("Risk Prediction: Found") if RISK_MODEL_PATH.exists() else st.sidebar.info("Risk Prediction: Not found")
+st.sidebar.success("CAP Grade: Found") if CAP_MODEL_PATH.exists() else st.sidebar.info("CAP Grade: Not found")
 
 
 # =====================================================
-# MAIN DASHBOARD
+# MAIN DASHBOARD AND IMAGE INPUT
 # =====================================================
 
 st.title("👁️ Retina AI Research Dashboard")
-
 st.caption(
     "Upload a retinal image, capture a retinal image, "
     "or capture an external eye photo."
 )
-
-st.warning(
-    "For research use only. Outputs do not provide a "
-    "confirmed medical diagnosis."
-)
-
-
-# =====================================================
-# THREE SIDE-BY-SIDE IMAGE OPTIONS
-# =====================================================
+st.warning("For research use only. Not a confirmed diagnosis.")
 
 upload_col, retina_col, external_col = st.columns(3)
 
 with upload_col:
     st.subheader("🖼️ Upload Image")
-
     uploaded_file = st.file_uploader(
         "Choose retinal image",
         type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"],
@@ -968,7 +707,6 @@ with upload_col:
 
 with retina_col:
     st.subheader("📷 Retina Camera")
-
     camera_photo = st.camera_input(
         "Capture retinal/fundus image",
         key="retina_camera",
@@ -976,54 +714,37 @@ with retina_col:
 
 with external_col:
     st.subheader("👁️ External Eye Photo")
-
     external_eye_photo = st.camera_input(
         "Capture external eye",
         key="external_eye_camera",
     )
-
-
-# =====================================================
-# LOAD SELECTED RETINAL IMAGE
-# Upload takes priority when both are present.
-# =====================================================
 
 image = None
 image_key = None
 
 try:
     if uploaded_file is not None:
-        image_bytes = uploaded_file.getvalue()
-        image = Image.open(
-            uploaded_file
-        ).convert("RGB")
-        image_key = str(hash(image_bytes))
-
+        raw = uploaded_file.getvalue()
+        image = Image.open(uploaded_file).convert("RGB")
+        image_key = str(hash(raw))
     elif camera_photo is not None:
-        camera_bytes = camera_photo.getvalue()
-        image = Image.open(
-            camera_photo
-        ).convert("RGB")
-        image_key = str(hash(camera_bytes))
-
+        raw = camera_photo.getvalue()
+        image = Image.open(camera_photo).convert("RGB")
+        image_key = str(hash(raw))
 except Exception as error:
-    st.error(
-        f"Could not open retinal image: {error}"
-    )
+    st.error(f"Could not open retinal image: {error}")
 
 
 # =====================================================
-# RETINAL IMAGE PREVIEW AND PREDICTIONS
+# RETINAL PREDICTIONS
 # =====================================================
 
 if image is not None:
     st.divider()
-
     image_col, info_col = st.columns([1, 1])
 
     with image_col:
         st.subheader("Selected Retinal Image")
-
         st.image(
             image,
             caption="Retinal / Fundus Image",
@@ -1037,10 +758,7 @@ if image is not None:
         st.write(f"Runtime device: {DEVICE}")
 
         if image_key != st.session_state.last_retinal_image_key:
-            st.caption(
-                "A new image is selected. Run predictions to "
-                "calculate results for this image."
-            )
+            st.caption("New image selected. Run predictions.")
 
         run_button = st.button(
             "🔍 Run Retinal Predictions",
@@ -1050,71 +768,49 @@ if image is not None:
         )
 
     if run_button:
-        prediction_results = {}
-
+        results = {}
         st.session_state.retinal_results = {}
         st.session_state.last_retinal_image_key = image_key
 
         st.divider()
         st.header("Retinal Prediction Results")
 
-        for model_name, (filename, task) in MODEL_FILES.items():
-            with st.expander(
-                model_name,
-                expanded=True,
-            ):
+        for name, (filename, task) in MODEL_FILES.items():
+            with st.expander(name, expanded=True):
                 try:
-                    with st.spinner(
-                        f"Running {model_name}..."
-                    ):
-                        model = load_model(
-                            str(MODEL_DIR / filename),
-                            task,
-                        )
+                    path = MODEL_DIR / filename
 
-                        result = run_prediction(
-                            model,
-                            image,
-                            task,
-                        )
-
-                    prediction_results[model_name] = result
-                    display_model_result(
-                        model_name,
-                        result,
+                    model = load_model(
+                        str(path), task,
+                        path.stat().st_mtime if path.exists() else 0,
                     )
+
+                    result = run_prediction(model, image, task)
+                    results[name] = result
+                    display_model_result(name, result)
 
                 except Exception as error:
-                    st.error(
-                        f"{model_name} failed: {error}"
-                    )
+                    st.error(f"{name} failed: {error}")
 
-        st.session_state.retinal_results = prediction_results
+        st.session_state.retinal_results = results
 
 elif st.session_state.retinal_results:
-    st.divider()
     st.header("Previous Retinal Prediction Results")
-
-    st.caption(
-        "These are the results from the previous prediction run."
-    )
-
     for name, result in st.session_state.retinal_results.items():
         with st.expander(name):
             display_model_result(name, result)
 
 
 # =====================================================
-# NEW RISK PREDICTION SECTION
+# RISK PREDICTION
 # =====================================================
 
 st.divider()
-display_risk_prediction()
+display_risk_prediction(image)
 
 
 # =====================================================
-# EXTERNAL EYE PHOTO PREVIEW
-# This is not a retinal/fundus image.
+# EXTERNAL EYE PHOTO
 # =====================================================
 
 if external_eye_photo is not None:
@@ -1122,39 +818,27 @@ if external_eye_photo is not None:
     st.header("👁️ External Eye Photo")
 
     try:
-        external_eye_image = Image.open(
+        external_image = Image.open(
             external_eye_photo
         ).convert("RGB")
 
         st.image(
-            external_eye_image,
+            external_image,
             caption="Captured External Eye Photo",
             use_container_width=True,
         )
 
-        st.success(
-            "External eye photo captured successfully."
-        )
-
-        with st.expander("Image Information"):
-            st.write(
-                f"Width: {external_eye_image.width} px"
-            )
-            st.write(
-                f"Height: {external_eye_image.height} px"
-            )
+        st.success("External eye photo captured successfully.")
+        st.write(f"Width: {external_image.width} px")
+        st.write(f"Height: {external_image.height} px")
 
         st.info(
-            "External-eye AI prediction is not enabled. "
-            "A separately trained and validated model for "
-            "external-eye photographs is required. The existing "
-            "retinal models are not assumed to work on these images."
+            "External-eye prediction is not enabled. A separately "
+            "trained model is required."
         )
 
     except Exception as error:
-        st.error(
-            f"Could not open external eye photo: {error}"
-        )
+        st.error(f"Could not open external eye photo: {error}")
 
 
 # =====================================================
@@ -1164,56 +848,43 @@ if external_eye_photo is not None:
 st.divider()
 st.subheader("🩺 CIMT Classification")
 
-cimt_value = st.session_state.retinal_results.get(
-    "CIMT Estimate"
-)
+cimt_value = st.session_state.retinal_results.get("CIMT Estimate")
 
 if cimt_value is not None:
-    st.metric(
-        "Raw CIMT Model Output",
-        f"{float(cimt_value):.4f}",
-    )
-
+    st.metric("Raw CIMT Model Output", f"{float(cimt_value):.4f}")
     st.warning(
-        "Units and a validated cutoff are unknown. True/False "
-        "classification is disabled until the model units and "
-        "clinical threshold are verified."
+        "Units and validated cutoff are unknown. "
+        "Clinical classification is disabled."
     )
 else:
-    st.info(
-        "Run retinal predictions to display the raw CIMT output."
-    )
+    st.info("Run retinal predictions to display CIMT output.")
 
 
 # =====================================================
-# CAD PREDICTION
+# CAD AND CAP
 # =====================================================
 
 st.divider()
 display_cad_prediction()
 
+st.divider()
+st.subheader("🔬 CAP Grade")
 
-# =====================================================
-# OTHER ADDITIONAL PREDICTIONS
-# =====================================================
+if CAP_MODEL_PATH.exists():
+    st.warning(
+        "CAP model file exists, but its architecture and grade "
+        "mapping are not configured."
+    )
+else:
+    st.info(
+        "A compatible trained CAP model and verified grade labels "
+        "are required."
+    )
 
 st.divider()
-st.header("Additional Predictions")
-
-display_other_additional_predictions()
-
-
-# =====================================================
-# FOOTER
-# =====================================================
-
-st.divider()
-
 st.caption(
     "Research prototype only. Not validated for clinical diagnosis."
 )
-
 st.sidebar.caption(
-    "Camera access requires browser permission and HTTPS "
-    "when deployed."
+    "Camera access may require browser permission and HTTPS."
 )
