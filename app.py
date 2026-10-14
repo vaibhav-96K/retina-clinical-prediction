@@ -4,7 +4,10 @@ from pathlib import Path
 
 import streamlit as st
 import numpy as np
+import pandas as pd
+import joblib
 from PIL import Image
+
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
@@ -41,10 +44,11 @@ div[data-testid="stMetric"] {
 PROJECT_DIR = Path(__file__).resolve().parent
 MODEL_DIR = PROJECT_DIR / "models"
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
 IMAGE_SIZE = 224
 
-# Required display order
 MODEL_FILES = {
     "Retinal Age": ("retina_age_model.pth", "regression"),
     "Retinal Sex": ("retina_sex_model_v2.pth", "classification"),
@@ -64,13 +68,11 @@ DISEASE_LABELS = [
 ]
 
 SEX_CLASS_LABELS = ["Female", "Male"]
-
-# Temporary threshold; validate with training data before clinical use.
 DIABETES_THRESHOLD = 0.50
 
-# Additional model filenames expected if you add these models later.
+CAD_MODEL_FILE = "cad_heart_disease_model.joblib"
+
 ADDITIONAL_MODELS = {
-    "CAD / Heart Disease": "cad_heart_disease_model.pth",
     "Risk Prediction": "risk_prediction_model.pth",
     "CAP Grade": "cap_grade_model.pth",
 }
@@ -91,7 +93,7 @@ TRANSFORM = transforms.Compose([
 
 
 # =====================================================
-# MODEL LOADING
+# RETINAL MODEL LOADING
 # =====================================================
 
 def extract_state_dict(checkpoint):
@@ -178,7 +180,221 @@ def load_model(path, task):
 
 
 # =====================================================
-# PREDICTION HELPERS
+# CAD MODEL LOADING
+# =====================================================
+
+CAD_MODEL_PATH = MODEL_DIR / CAD_MODEL_FILE
+
+
+@st.cache_resource(show_spinner=False)
+def load_cad_model(path, modified_time):
+    # The file is a joblib artifact exported by our Colab notebook.
+    # Only load trusted model files.
+    artifact = joblib.load(path)
+
+    required_keys = {"model", "feature_columns", "classes"}
+    missing = required_keys - set(artifact.keys())
+
+    if missing:
+        raise ValueError(
+            f"CAD artifact is missing keys: {sorted(missing)}"
+        )
+
+    if not artifact["feature_columns"]:
+        raise ValueError("CAD feature_columns is empty.")
+
+    return artifact
+
+
+# Dataset category codes used during training.
+# Verify these codes against the exact training dataset.
+CAD_CATEGORICAL_OPTIONS = {
+    "sex": [0, 1],
+    "cp": [1, 2, 3, 4],
+    "fbs": [0, 1],
+    "restecg": [0, 1, 2],
+    "exang": [0, 1],
+    "slope": [1, 2, 3],
+    "ca": [0, 1, 2, 3],
+    "thal": [3, 6, 7],
+}
+
+CAD_NUMERIC_RANGES = {
+    "age": (1, 120, 50.0),
+    "trestbps": (50, 300, 120.0),
+    "chol": (50, 800, 200.0),
+    "thalach": (30, 250, 150.0),
+    "oldpeak": (0.0, 10.0, 1.0),
+}
+
+
+# =====================================================
+# CAD CLINICAL INPUT FORM
+# =====================================================
+
+def render_cad_input(feature_columns, numeric_columns,
+                     categorical_columns):
+
+    values = {}
+
+    st.write(
+        "Enter clinical measurements using the units and category "
+        "codes expected by the training dataset."
+    )
+
+    st.caption(
+        "The values below are form defaults only. Replace them with "
+        "verified measurements; do not use guessed values for assessment."
+    )
+
+    with st.form("cad_clinical_form"):
+        col1, col2 = st.columns(2)
+
+        for index, feature in enumerate(feature_columns):
+            container = col1 if index % 2 == 0 else col2
+
+            with container:
+                if feature in CAD_CATEGORICAL_OPTIONS:
+                    options = CAD_CATEGORICAL_OPTIONS[feature]
+
+                    value = st.selectbox(
+                        f"{feature} (dataset code)",
+                        options=options,
+                        key=f"cad_{feature}",
+                    )
+
+                elif feature in CAD_NUMERIC_RANGES:
+                    minimum, maximum, default = CAD_NUMERIC_RANGES[feature]
+
+                    value = st.number_input(
+                        feature,
+                        min_value=float(minimum),
+                        max_value=float(maximum),
+                        value=float(default),
+                        step=0.1 if feature == "oldpeak" else 1.0,
+                        key=f"cad_{feature}",
+                    )
+
+                elif feature in numeric_columns:
+                    value = st.number_input(
+                        feature,
+                        value=0.0,
+                        key=f"cad_{feature}",
+                    )
+
+                elif feature in categorical_columns:
+                    value = st.text_input(
+                        f"{feature} (category)",
+                        key=f"cad_{feature}",
+                    ).strip()
+
+                    if value == "":
+                        st.warning(
+                            f"Enter a category value for {feature}."
+                        )
+
+                else:
+                    value = st.text_input(
+                        feature,
+                        key=f"cad_{feature}",
+                    ).strip()
+
+            values[feature] = value
+
+        submitted = st.form_submit_button(
+            "Run CAD Prediction",
+            type="primary",
+            use_container_width=True,
+        )
+
+    return submitted, values
+
+
+def display_cad_prediction():
+    st.subheader("❤️ CAD / Heart Disease")
+
+    if not CAD_MODEL_PATH.exists():
+        st.info(
+            "CAD model is not installed yet. Upload "
+            f"`models/{CAD_MODEL_FILE}` from your Colab training."
+        )
+        return
+
+    try:
+        artifact = load_cad_model(
+            str(CAD_MODEL_PATH),
+            CAD_MODEL_PATH.stat().st_mtime,
+        )
+    except Exception as error:
+        st.error(f"Could not load CAD model: {error}")
+        return
+
+    feature_columns = artifact["feature_columns"]
+    numeric_columns = artifact.get("numeric_columns", [])
+    categorical_columns = artifact.get("categorical_columns", [])
+
+    st.caption(
+        f"Loaded clinical model with {len(feature_columns)} input features."
+    )
+
+    submitted, values = render_cad_input(
+        feature_columns,
+        numeric_columns,
+        categorical_columns,
+    )
+
+    if not submitted:
+        st.caption(
+            "Complete the form and select Run CAD Prediction."
+        )
+        return
+
+    try:
+        # Construct input in the exact order saved during training.
+        row = pd.DataFrame(
+            [[values[col] for col in feature_columns]],
+            columns=feature_columns,
+        )
+
+        # Match the training data's numeric feature types.
+        for col in numeric_columns:
+            row[col] = pd.to_numeric(row[col], errors="raise")
+
+        model = artifact["model"]
+        prediction = int(model.predict(row)[0])
+
+        classes = artifact["classes"]
+
+        if prediction < 0 or prediction >= len(classes):
+            raise ValueError(
+                "Prediction does not match the saved class mapping."
+            )
+
+        predicted_label = classes[prediction]
+
+        st.markdown("### Model output")
+        st.write(f"**Predicted class:** {predicted_label}")
+
+        if hasattr(model, "predict_proba"):
+            probabilities = model.predict_proba(row)[0]
+
+            if len(probabilities) == len(classes):
+                st.write("Class scores:")
+                for label, score in zip(classes, probabilities):
+                    st.write(f"- {label}: {float(score):.1%}")
+
+        st.warning(
+            "Research prototype only. These model scores are not "
+            "validated clinical probabilities or a medical diagnosis. "
+            "Do not use them to make treatment decisions."
+        )
+
+    except Exception as error:
+        st.error(f"CAD prediction failed: {error}")
+
+
+# =====================================================
+# RETINAL PREDICTION HELPERS
 # =====================================================
 
 def run_prediction(model, image, task):
@@ -236,10 +452,6 @@ def run_prediction(model, image, task):
         for index, probability in enumerate(probabilities)
     }
 
-
-# =====================================================
-# MAIN PREDICTION DISPLAY
-# =====================================================
 
 def display_sex(result):
     if not isinstance(result, dict) or len(result) != 2:
@@ -315,109 +527,45 @@ def display_model_result(name, result):
 
 
 # =====================================================
-# ADDITIONAL PREDICTIONS
+# OTHER ADDITIONAL PREDICTIONS
 # =====================================================
 
-def display_additional_predictions(prediction_results):
-    st.divider()
-    st.header("Additional Predictions")
+def display_other_additional_predictions():
+    risk_col, cap_col = st.columns(2)
 
-    cad_col, risk_col = st.columns(2)
-
-    # CAD / HEART DISEASE
-    with cad_col:
-        st.subheader("❤️ CAD / Heart Disease")
-
-        cad_path = MODEL_DIR / ADDITIONAL_MODELS["CAD / Heart Disease"]
-
-        if cad_path.exists():
-            st.warning(
-                f"Model file found: {cad_path.name}. "
-                "Its architecture, input format, class labels and "
-                "calibration must be configured before prediction."
-            )
-        else:
-            st.info(
-                "CAD prediction is not available yet. "
-                "A trained and validated CAD model is required."
-            )
-
-        st.caption(
-            "No CAD probability or diagnosis is generated by this section."
-        )
-
-    # RISK PREDICTION
     with risk_col:
         st.subheader("📊 Risk Prediction")
-
         risk_path = MODEL_DIR / ADDITIONAL_MODELS["Risk Prediction"]
 
         if risk_path.exists():
             st.warning(
-                f"Model file found: {risk_path.name}. "
-                "Required input variables, calibration and risk categories "
-                "must be configured before prediction."
+                f"{risk_path.name} exists, but its model format, "
+                "required inputs and risk label mapping are not configured."
             )
         else:
             st.info(
-                "Risk prediction is not available yet. "
-                "A validated risk model and its required inputs are needed."
+                "Risk prediction is unavailable. A compatible trained "
+                "risk model and its required inputs are needed."
             )
 
-        st.caption(
-            "No Low/Moderate/High risk category is invented."
-        )
+        st.caption("No risk category is invented.")
 
-    st.divider()
-    cimt_col, cap_col = st.columns(2)
-
-    # CIMT CLASSIFICATION
-    with cimt_col:
-        st.subheader("🩺 CIMT Classification")
-
-        cimt_value = prediction_results.get("CIMT Estimate")
-
-        if cimt_value is not None:
-            st.metric(
-                "Raw CIMT Model Output",
-                f"{float(cimt_value):.4f}",
-            )
-
-            st.warning(
-                "Units and a validated cutoff are unknown. "
-                "True/False classification is disabled."
-            )
-        else:
-            st.info(
-                "CIMT output is unavailable. Check the model loading result."
-            )
-
-    # CAP GRADE
     with cap_col:
         st.subheader("🔬 CAP Grade")
-
         cap_path = MODEL_DIR / ADDITIONAL_MODELS["CAP Grade"]
 
         if cap_path.exists():
             st.warning(
-                f"Model file found: {cap_path.name}. "
-                "Its architecture, grade labels and output mapping "
-                "must be configured before prediction."
+                f"{cap_path.name} exists, but its model format and "
+                "verified grade mapping are not configured."
             )
         else:
             st.info(
-                "CAP Grade prediction is not available yet. "
-                "A trained CAP model and verified grade mapping are required."
+                "CAP Grade is unavailable. A compatible trained model "
+                "and verified grade labels are needed."
             )
 
-        st.caption(
-            "No CAP grade is generated without a compatible trained model."
-        )
-
-    st.divider()
-    st.caption(
-        "Research prototype only. These outputs are not a medical diagnosis."
-    )
+        st.caption("No CAP grade is generated without a compatible model.")
 
 
 # =====================================================
@@ -428,7 +576,7 @@ st.sidebar.title("👁️ Retina AI")
 st.sidebar.write("Research Prediction Dashboard")
 st.sidebar.caption(f"Device: {DEVICE}")
 
-st.sidebar.subheader("Configured Models")
+st.sidebar.subheader("Retinal Models")
 
 for name, (filename, _) in MODEL_FILES.items():
     if (MODEL_DIR / filename).exists():
@@ -436,7 +584,12 @@ for name, (filename, _) in MODEL_FILES.items():
     else:
         st.sidebar.error(f"{name}: Missing")
 
-st.sidebar.subheader("Additional Model Files")
+st.sidebar.subheader("Clinical Models")
+
+if CAD_MODEL_PATH.exists():
+    st.sidebar.success("CAD model: Found")
+else:
+    st.sidebar.info("CAD model: Not found")
 
 for name, filename in ADDITIONAL_MODELS.items():
     if (MODEL_DIR / filename).exists():
@@ -450,10 +603,9 @@ for name, filename in ADDITIONAL_MODELS.items():
 # =====================================================
 
 st.title("👁️ Retina AI Research Dashboard")
-st.write("Take a photo or upload a retinal image.")
 
 st.warning(
-    "For research use only. This app does not provide a confirmed "
+    "For research use only. Outputs do not provide a confirmed "
     "medical diagnosis or replace professional clinical assessment."
 )
 
@@ -487,9 +639,9 @@ else:
             st.error("Could not open image. Upload a valid image.")
 
 
-# =====================================================
-# RUN ALL CONFIGURED PREDICTIONS
-# =====================================================
+# Save retinal results across Streamlit reruns.
+if "retinal_results" not in st.session_state:
+    st.session_state.retinal_results = {}
 
 if image is not None:
     image_col, info_col = st.columns(2)
@@ -508,16 +660,15 @@ if image is not None:
         st.write(f"Device: {DEVICE}")
 
     if st.button(
-        "🔍 Run Predictions",
+        "🔍 Run Retinal Predictions",
         type="primary",
         use_container_width=True,
     ):
         prediction_results = {}
 
         st.divider()
-        st.header("Prediction Results")
+        st.header("Retinal Prediction Results")
 
-        # Dict insertion order determines the display order.
         for model_name, (filename, task) in MODEL_FILES.items():
             with st.expander(model_name, expanded=True):
                 try:
@@ -534,11 +685,50 @@ if image is not None:
                 except Exception as error:
                     st.error(f"{model_name} failed: {error}")
 
-        # Additional cards use the results from this same run.
-        display_additional_predictions(prediction_results)
+        st.session_state.retinal_results = prediction_results
 
+# Show previously saved retinal results after reruns.
+elif st.session_state.retinal_results:
+    st.header("Previous Retinal Prediction Results")
+    st.caption("These are the results from the last retinal prediction run.")
+
+    for name, result in st.session_state.retinal_results.items():
+        with st.expander(name):
+            display_model_result(name, result)
+
+
+# =====================================================
+# ADDITIONAL PREDICTIONS — ALWAYS AVAILABLE
+# =====================================================
+
+st.divider()
+st.header("Additional Predictions")
+
+# CAD form is independent of retinal image upload.
+display_cad_prediction()
+
+st.divider()
+st.subheader("🩺 CIMT Classification")
+
+cimt_value = st.session_state.retinal_results.get("CIMT Estimate")
+
+if cimt_value is not None:
+    st.metric("Raw CIMT Model Output", f"{float(cimt_value):.4f}")
+    st.warning(
+        "Units and a validated cutoff are unknown. "
+        "True/False classification is disabled."
+    )
 else:
-    st.info("Choose Take Photo or Upload Image to get started.")
+    st.info(
+        "Run a retinal prediction to display the existing raw CIMT output."
+    )
+
+st.divider()
+display_other_additional_predictions()
+
+st.caption(
+    "Research prototype only. Not validated for clinical diagnosis."
+)
 
 st.sidebar.caption(
     "Camera access requires browser permission and HTTPS when deployed."
