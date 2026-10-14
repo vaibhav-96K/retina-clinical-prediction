@@ -10,7 +10,9 @@ import torch.nn as nn
 from torchvision import models, transforms
 
 
-# ==================== PAGE SETTINGS ====================
+# =====================================================
+# PAGE CONFIG
+# =====================================================
 
 st.set_page_config(
     page_title="Retina AI Dashboard",
@@ -20,10 +22,10 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-.main {background-color: #f5f8fc;}
-h1, h2, h3 {color: #17365d;}
+.main { background-color: #f5f8fc; }
+h1, h2, h3 { color: #17365d; }
 div[data-testid="stMetric"] {
-    background-color: white;
+    background: white;
     border: 1px solid #dce5f0;
     padding: 14px;
     border-radius: 12px;
@@ -32,16 +34,17 @@ div[data-testid="stMetric"] {
 """, unsafe_allow_html=True)
 
 
-# ==================== CONFIGURATION ====================
+# =====================================================
+# CONFIGURATION
+# =====================================================
 
 PROJECT_DIR = Path(__file__).resolve().parent
 MODEL_DIR = PROJECT_DIR / "models"
 
-IMAGE_SIZE = 224
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+IMAGE_SIZE = 224
 
-# Display order requested:
-# Retinal Age -> Retinal Sex -> Retinal Disease -> CIMT Estimate
+# Required display order
 MODEL_FILES = {
     "Retinal Age": ("retina_age_model.pth", "regression"),
     "Retinal Sex": ("retina_sex_model_v2.pth", "classification"),
@@ -60,14 +63,22 @@ DISEASE_LABELS = [
     "Other",
 ]
 
-# Confirm class order from the original training labels.
 SEX_CLASS_LABELS = ["Female", "Male"]
 
-# Temporary threshold; must be validated against the training data.
+# Temporary threshold; validate with training data before clinical use.
 DIABETES_THRESHOLD = 0.50
 
+# Additional model filenames expected if you add these models later.
+ADDITIONAL_MODELS = {
+    "CAD / Heart Disease": "cad_heart_disease_model.pth",
+    "Risk Prediction": "risk_prediction_model.pth",
+    "CAP Grade": "cap_grade_model.pth",
+}
 
-# ==================== IMAGE TRANSFORM ====================
+
+# =====================================================
+# IMAGE TRANSFORM
+# =====================================================
 
 TRANSFORM = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
@@ -79,7 +90,9 @@ TRANSFORM = transforms.Compose([
 ])
 
 
-# ==================== MODEL LOADING ====================
+# =====================================================
+# MODEL LOADING
+# =====================================================
 
 def extract_state_dict(checkpoint):
     if isinstance(checkpoint, nn.Module):
@@ -157,7 +170,6 @@ def load_model(path, task):
             output_size,
         )
 
-        # Stop if this architecture does not match the checkpoint.
         model.load_state_dict(state, strict=True)
 
     model.to(DEVICE)
@@ -165,7 +177,9 @@ def load_model(path, task):
     return model
 
 
-# ==================== PREDICTION ====================
+# =====================================================
+# PREDICTION HELPERS
+# =====================================================
 
 def run_prediction(model, image, task):
     tensor = TRANSFORM(
@@ -223,11 +237,13 @@ def run_prediction(model, image, task):
     }
 
 
-# ==================== DISPLAY HELPERS ====================
+# =====================================================
+# MAIN PREDICTION DISPLAY
+# =====================================================
 
 def display_sex(result):
     if not isinstance(result, dict) or len(result) != 2:
-        st.error("Sex model did not return exactly two class scores.")
+        st.error("Sex model did not return two class scores.")
         return
 
     scores = list(result.values())
@@ -237,13 +253,9 @@ def display_sex(result):
         st.error("Sex class mapping is unavailable.")
         return
 
-    st.metric(
-        "Predicted Sex",
-        SEX_CLASS_LABELS[predicted_index],
-    )
-
+    st.metric("Predicted Sex", SEX_CLASS_LABELS[predicted_index])
     st.caption(
-        "Verify Male/Female order against the original training labels."
+        "Confirm Female/Male class order against the training labels."
     )
 
 
@@ -252,70 +264,171 @@ def display_disease(result):
 
     if len(scores) != len(DISEASE_LABELS):
         st.error(
-            f"Expected {len(DISEASE_LABELS)} disease outputs, "
-            f"but model returned {len(scores)}."
+            f"Expected {len(DISEASE_LABELS)} disease outputs; "
+            f"received {len(scores)}."
         )
-        st.write("Raw model outputs:", scores.tolist())
+        st.write("Raw outputs:", scores.tolist())
         return
 
-    # This index is valid only if the training label order matches.
     diabetes_score = float(np.clip(scores[1], 0, 1))
 
-    diabetes_status = (
+    status = (
         "Positive"
         if diabetes_score >= DIABETES_THRESHOLD
         else "Negative"
     )
 
-    st.metric("Diabetes Model Result", diabetes_status)
-    st.write(f"Diabetes model score: {diabetes_score * 100:.1f}%")
+    st.metric("Diabetes Model Result", status)
+    st.write(f"Model score: {diabetes_score * 100:.1f}%")
     st.progress(diabetes_score)
 
     st.caption(
-        "Experimental result only. Confirm the training label order "
-        "and validate the threshold before interpreting the output."
+        "Experimental output only. Verify class order and threshold "
+        "against training data."
     )
 
-    with st.expander("View all retinal disease scores"):
+    with st.expander("All retinal disease scores"):
         for label, score in zip(DISEASE_LABELS, scores):
             score = float(np.clip(score, 0, 1))
             st.write(f"**{label}:** {score * 100:.1f}%")
             st.progress(score)
 
 
-def display_model_result(title, result):
-    st.subheader(title)
+def display_model_result(name, result):
+    st.subheader(name)
 
-    if title == "Retinal Age":
-        st.metric(
-            "Estimated Age",
-            f"{float(result):.1f} years",
-        )
+    if name == "Retinal Age":
+        st.metric("Estimated Age", f"{float(result):.1f} years")
 
-    elif title == "Retinal Sex":
+    elif name == "Retinal Sex":
         display_sex(result)
 
-    elif title == "Retinal Disease":
+    elif name == "Retinal Disease":
         display_disease(result)
 
-    elif title == "CIMT Estimate":
-        st.metric(
-            "CIMT Model Output",
-            f"{float(result):.4f}",
-        )
+    elif name == "CIMT Estimate":
+        st.metric("Raw CIMT Model Output", f"{float(result):.4f}")
         st.caption(
-            "Numeric regression output. Confirm the units and a validated "
-            "threshold before converting this to True/False."
+            "Units have not been verified. Classification is disabled "
+            "until units and a validated threshold are confirmed."
         )
 
 
-# ==================== SIDEBAR ====================
+# =====================================================
+# ADDITIONAL PREDICTIONS
+# =====================================================
+
+def display_additional_predictions(prediction_results):
+    st.divider()
+    st.header("Additional Predictions")
+
+    cad_col, risk_col = st.columns(2)
+
+    # CAD / HEART DISEASE
+    with cad_col:
+        st.subheader("❤️ CAD / Heart Disease")
+
+        cad_path = MODEL_DIR / ADDITIONAL_MODELS["CAD / Heart Disease"]
+
+        if cad_path.exists():
+            st.warning(
+                f"Model file found: {cad_path.name}. "
+                "Its architecture, input format, class labels and "
+                "calibration must be configured before prediction."
+            )
+        else:
+            st.info(
+                "CAD prediction is not available yet. "
+                "A trained and validated CAD model is required."
+            )
+
+        st.caption(
+            "No CAD probability or diagnosis is generated by this section."
+        )
+
+    # RISK PREDICTION
+    with risk_col:
+        st.subheader("📊 Risk Prediction")
+
+        risk_path = MODEL_DIR / ADDITIONAL_MODELS["Risk Prediction"]
+
+        if risk_path.exists():
+            st.warning(
+                f"Model file found: {risk_path.name}. "
+                "Required input variables, calibration and risk categories "
+                "must be configured before prediction."
+            )
+        else:
+            st.info(
+                "Risk prediction is not available yet. "
+                "A validated risk model and its required inputs are needed."
+            )
+
+        st.caption(
+            "No Low/Moderate/High risk category is invented."
+        )
+
+    st.divider()
+    cimt_col, cap_col = st.columns(2)
+
+    # CIMT CLASSIFICATION
+    with cimt_col:
+        st.subheader("🩺 CIMT Classification")
+
+        cimt_value = prediction_results.get("CIMT Estimate")
+
+        if cimt_value is not None:
+            st.metric(
+                "Raw CIMT Model Output",
+                f"{float(cimt_value):.4f}",
+            )
+
+            st.warning(
+                "Units and a validated cutoff are unknown. "
+                "True/False classification is disabled."
+            )
+        else:
+            st.info(
+                "CIMT output is unavailable. Check the model loading result."
+            )
+
+    # CAP GRADE
+    with cap_col:
+        st.subheader("🔬 CAP Grade")
+
+        cap_path = MODEL_DIR / ADDITIONAL_MODELS["CAP Grade"]
+
+        if cap_path.exists():
+            st.warning(
+                f"Model file found: {cap_path.name}. "
+                "Its architecture, grade labels and output mapping "
+                "must be configured before prediction."
+            )
+        else:
+            st.info(
+                "CAP Grade prediction is not available yet. "
+                "A trained CAP model and verified grade mapping are required."
+            )
+
+        st.caption(
+            "No CAP grade is generated without a compatible trained model."
+        )
+
+    st.divider()
+    st.caption(
+        "Research prototype only. These outputs are not a medical diagnosis."
+    )
+
+
+# =====================================================
+# SIDEBAR
+# =====================================================
 
 st.sidebar.title("👁️ Retina AI")
 st.sidebar.write("Research Prediction Dashboard")
 st.sidebar.caption(f"Device: {DEVICE}")
 
-st.sidebar.subheader("Model Files")
+st.sidebar.subheader("Configured Models")
 
 for name, (filename, _) in MODEL_FILES.items():
     if (MODEL_DIR / filename).exists():
@@ -323,19 +436,26 @@ for name, (filename, _) in MODEL_FILES.items():
     else:
         st.sidebar.error(f"{name}: Missing")
 
+st.sidebar.subheader("Additional Model Files")
 
-# ==================== MAIN APP ====================
+for name, filename in ADDITIONAL_MODELS.items():
+    if (MODEL_DIR / filename).exists():
+        st.sidebar.success(f"{name}: File found")
+    else:
+        st.sidebar.info(f"{name}: Not found")
+
+
+# =====================================================
+# MAIN APP
+# =====================================================
 
 st.title("👁️ Retina AI Research Dashboard")
 st.write("Take a photo or upload a retinal image.")
 
 st.warning(
-    "Research use only. This app does not provide a confirmed medical "
-    "diagnosis and should not be used to make treatment decisions."
+    "For research use only. This app does not provide a confirmed "
+    "medical diagnosis or replace professional clinical assessment."
 )
-
-
-# ==================== CAMERA / UPLOAD ====================
 
 source = st.radio(
     "Choose image source",
@@ -367,32 +487,37 @@ else:
             st.error("Could not open image. Upload a valid image.")
 
 
-# ==================== RUN PREDICTIONS ====================
+# =====================================================
+# RUN ALL CONFIGURED PREDICTIONS
+# =====================================================
 
 if image is not None:
-    left, right = st.columns(2)
+    image_col, info_col = st.columns(2)
 
-    with left:
+    with image_col:
         st.image(
             image,
             caption="Selected retinal image",
             use_container_width=True,
         )
 
-    with right:
+    with info_col:
         st.subheader("Image Information")
         st.write(f"Width: {image.width} px")
         st.write(f"Height: {image.height} px")
+        st.write(f"Device: {DEVICE}")
 
     if st.button(
         "🔍 Run Predictions",
         type="primary",
         use_container_width=True,
     ):
+        prediction_results = {}
+
         st.divider()
         st.header("Prediction Results")
 
-        # MODEL_FILES insertion order controls displayed result order.
+        # Dict insertion order determines the display order.
         for model_name, (filename, task) in MODEL_FILES.items():
             with st.expander(model_name, expanded=True):
                 try:
@@ -403,49 +528,18 @@ if image is not None:
                         )
                         result = run_prediction(model, image, task)
 
+                    prediction_results[model_name] = result
                     display_model_result(model_name, result)
 
                 except Exception as error:
                     st.error(f"{model_name} failed: {error}")
 
-        st.divider()
-        st.header("Additional Predictions")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.markdown("### CAD / Heart Disease")
-            st.info(
-                "Not configured: a trained CAD/heart disease model "
-                "and verified output mapping are not configured."
-            )
-
-            st.markdown("### Risk Prediction")
-            st.info(
-                "Not configured: a validated risk model or calibrated "
-                "probability calculation is not available."
-            )
-
-        with col2:
-            st.markdown("### CIMT Classification")
-            st.info(
-                "The current CIMT model returns a numeric value. "
-                "True/False requires verified units and a validated threshold."
-            )
-
-            st.markdown("### CAP Grade")
-            st.info(
-                "Not configured: a trained CAP grade model and verified "
-                "grade mapping are not configured."
-            )
+        # Additional cards use the results from this same run.
+        display_additional_predictions(prediction_results)
 
 else:
     st.info("Choose Take Photo or Upload Image to get started.")
 
-
-# ==================== FOOTER ====================
-
 st.sidebar.caption(
-    "Camera access depends on browser permissions. "
-    "Use HTTPS and allow camera access when prompted."
+    "Camera access requires browser permission and HTTPS when deployed."
 )
