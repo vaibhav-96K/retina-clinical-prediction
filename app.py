@@ -40,10 +40,12 @@ MODEL_DIR = PROJECT_DIR / "models"
 IMAGE_SIZE = 224
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Display order requested:
+# Retinal Age -> Retinal Sex -> Retinal Disease -> CIMT Estimate
 MODEL_FILES = {
     "Retinal Age": ("retina_age_model.pth", "regression"),
-    "Retinal Disease": ("retina_disease_model.pth", "multilabel"),
     "Retinal Sex": ("retina_sex_model_v2.pth", "classification"),
+    "Retinal Disease": ("retina_disease_model.pth", "multilabel"),
     "CIMT Estimate": ("cimt_thickness_model.pth", "regression"),
 }
 
@@ -58,10 +60,10 @@ DISEASE_LABELS = [
     "Other",
 ]
 
-# Verify these labels against the original training notebook.
+# Confirm class order from the original training labels.
 SEX_CLASS_LABELS = ["Female", "Male"]
 
-# Temporary UI threshold only; validate before clinical interpretation.
+# Temporary threshold; must be validated against the training data.
 DIABETES_THRESHOLD = 0.50
 
 
@@ -94,7 +96,10 @@ def extract_state_dict(checkpoint):
             if isinstance(checkpoint.get(key), dict):
                 return checkpoint[key]
 
-        if checkpoint and all(torch.is_tensor(v) for v in checkpoint.values()):
+        if checkpoint and all(
+            torch.is_tensor(value)
+            for value in checkpoint.values()
+        ):
             return checkpoint
 
     raise ValueError("Unsupported checkpoint format.")
@@ -152,7 +157,7 @@ def load_model(path, task):
             output_size,
         )
 
-        # Do not silently accept a mismatched architecture.
+        # Stop if this architecture does not match the checkpoint.
         model.load_state_dict(state, strict=True)
 
     model.to(DEVICE)
@@ -190,8 +195,6 @@ def run_prediction(model, image, task):
         return float(values[0])
 
     if task == "multilabel":
-        # If outputs already resemble probabilities, retain them;
-        # otherwise apply sigmoid.
         if np.all((values >= 0) & (values <= 1)):
             return values
 
@@ -200,20 +203,23 @@ def run_prediction(model, image, task):
         )
 
     if len(values) == 1:
-        p = float(
+        probability = float(
             1.0 / (
                 1.0 + np.exp(-np.clip(values[0], -50, 50))
             )
         )
-        return {"Class 0": 1.0 - p, "Class 1": p}
+        return {
+            "Class 0": 1.0 - probability,
+            "Class 1": probability,
+        }
 
     shifted = values - np.max(values)
     exp_values = np.exp(np.clip(shifted, -50, 50))
     probabilities = exp_values / exp_values.sum()
 
     return {
-        f"Class {i}": float(p)
-        for i, p in enumerate(probabilities)
+        f"Class {index}": float(probability)
+        for index, probability in enumerate(probabilities)
     }
 
 
@@ -231,9 +237,13 @@ def display_sex(result):
         st.error("Sex class mapping is unavailable.")
         return
 
-    st.metric("Predicted Sex", SEX_CLASS_LABELS[predicted_index])
+    st.metric(
+        "Predicted Sex",
+        SEX_CLASS_LABELS[predicted_index],
+    )
+
     st.caption(
-        "Confirm that Female/Male matches the original training class order."
+        "Verify Male/Female order against the original training labels."
     )
 
 
@@ -248,7 +258,9 @@ def display_disease(result):
         st.write("Raw model outputs:", scores.tolist())
         return
 
+    # This index is valid only if the training label order matches.
     diabetes_score = float(np.clip(scores[1], 0, 1))
+
     diabetes_status = (
         "Positive"
         if diabetes_score >= DIABETES_THRESHOLD
@@ -260,8 +272,8 @@ def display_disease(result):
     st.progress(diabetes_score)
 
     st.caption(
-        "Experimental output only. The training label order and "
-        "threshold must be validated before interpreting this result."
+        "Experimental result only. Confirm the training label order "
+        "and validate the threshold before interpreting the output."
     )
 
     with st.expander("View all retinal disease scores"):
@@ -275,7 +287,10 @@ def display_model_result(title, result):
     st.subheader(title)
 
     if title == "Retinal Age":
-        st.metric("Estimated Age", f"{float(result):.1f} years")
+        st.metric(
+            "Estimated Age",
+            f"{float(result):.1f} years",
+        )
 
     elif title == "Retinal Sex":
         display_sex(result)
@@ -284,10 +299,13 @@ def display_model_result(title, result):
         display_disease(result)
 
     elif title == "CIMT Estimate":
-        st.metric("CIMT Model Output", f"{float(result):.4f}")
+        st.metric(
+            "CIMT Model Output",
+            f"{float(result):.4f}",
+        )
         st.caption(
-            "Numeric model output. Units and a validated cutoff are "
-            "needed before converting it to True/False."
+            "Numeric regression output. Confirm the units and a validated "
+            "threshold before converting this to True/False."
         )
 
 
@@ -313,7 +331,7 @@ st.write("Take a photo or upload a retinal image.")
 
 st.warning(
     "Research use only. This app does not provide a confirmed medical "
-    "diagnosis. Do not use its outputs to make treatment decisions."
+    "diagnosis and should not be used to make treatment decisions."
 )
 
 
@@ -346,7 +364,7 @@ else:
         try:
             image = Image.open(uploaded_file).convert("RGB")
         except Exception:
-            st.error("Could not open this image. Please upload a valid image.")
+            st.error("Could not open image. Upload a valid image.")
 
 
 # ==================== RUN PREDICTIONS ====================
@@ -374,6 +392,7 @@ if image is not None:
         st.divider()
         st.header("Prediction Results")
 
+        # MODEL_FILES insertion order controls displayed result order.
         for model_name, (filename, task) in MODEL_FILES.items():
             with st.expander(model_name, expanded=True):
                 try:
@@ -397,28 +416,27 @@ if image is not None:
         with col1:
             st.markdown("### CAD / Heart Disease")
             st.info(
-                "Not configured: no separate trained CAD/heart disease "
-                "model is listed in the current project configuration."
+                "Not configured: a trained CAD/heart disease model "
+                "and verified output mapping are not configured."
             )
 
             st.markdown("### Risk Prediction")
             st.info(
                 "Not configured: a validated risk model or calibrated "
-                "probability calculation is not available in this code."
+                "probability calculation is not available."
             )
 
         with col2:
             st.markdown("### CIMT Classification")
             st.info(
                 "The current CIMT model returns a numeric value. "
-                "True/False requires verified output units and a validated "
-                "threshold."
+                "True/False requires verified units and a validated threshold."
             )
 
             st.markdown("### CAP Grade")
             st.info(
-                "Not configured: a CAP grade model and verified grade "
-                "mapping are not listed in the current project."
+                "Not configured: a trained CAP grade model and verified "
+                "grade mapping are not configured."
             )
 
 else:
