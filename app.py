@@ -8,27 +8,34 @@ import torch
 import torch.nn as nn
 from torchvision import models, transforms
 
+
+# ---------------- PAGE SETTINGS ----------------
+
 st.set_page_config(
-    page_title="Retina AI Research Dashboard",
+    page_title="Retina AI Dashboard",
     page_icon="👁️",
     layout="wide",
 )
 
 st.markdown("""
 <style>
-.main { background-color: #f5f8fc; }
-h1, h2, h3 { color: #17365d; }
+.main {background-color: #f5f8fc;}
+h1, h2, h3 {color: #17365d;}
 div[data-testid="stMetric"] {
     background-color: white;
     border: 1px solid #dce5f0;
-    padding: 15px;
+    padding: 14px;
     border-radius: 12px;
 }
 </style>
 """, unsafe_allow_html=True)
 
+
+# ---------------- MODEL SETTINGS ----------------
+
 PROJECT_DIR = Path(__file__).resolve().parent
 MODEL_DIR = PROJECT_DIR / "models"
+
 IMAGE_SIZE = 224
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -40,9 +47,23 @@ MODEL_FILES = {
 }
 
 DISEASE_LABELS = [
-    "Normal", "Diabetes", "Glaucoma", "Cataract",
-    "AMD", "Hypertension", "Myopia", "Other"
+    "Normal",
+    "Diabetes",
+    "Glaucoma",
+    "Cataract",
+    "AMD",
+    "Hypertension",
+    "Myopia",
+    "Other",
 ]
+
+# IMPORTANT:
+# Change this only after checking the original training labels.
+# This example assumes class 0 = Female and class 1 = Male.
+SEX_CLASS_LABELS = ["Female", "Male"]
+
+
+# ---------------- IMAGE TRANSFORM ----------------
 
 TRANSFORM = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
@@ -54,14 +75,19 @@ TRANSFORM = transforms.Compose([
 ])
 
 
+# ---------------- MODEL HELPERS ----------------
+
 def extract_state_dict(checkpoint):
     if isinstance(checkpoint, nn.Module):
         return checkpoint.state_dict()
 
     if isinstance(checkpoint, dict):
         for key in (
-            "state_dict", "model_state_dict",
-            "model", "net", "weights"
+            "state_dict",
+            "model_state_dict",
+            "model",
+            "net",
+            "weights",
         ):
             if isinstance(checkpoint.get(key), dict):
                 checkpoint = checkpoint[key]
@@ -70,7 +96,7 @@ def extract_state_dict(checkpoint):
         if isinstance(checkpoint, dict):
             return checkpoint
 
-    raise ValueError("Unsupported model checkpoint format.")
+    raise ValueError("Unsupported checkpoint format.")
 
 
 def clean_state_dict(state):
@@ -108,7 +134,7 @@ def infer_output_size(state, default):
 @st.cache_resource(show_spinner=False)
 def load_model(path, task):
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"Model file not found: {path}")
+        raise FileNotFoundError(f"Model file missing: {path}")
 
     checkpoint = torch.load(
         path,
@@ -120,6 +146,7 @@ def load_model(path, task):
         model = checkpoint
     else:
         state = clean_state_dict(extract_state_dict(checkpoint))
+
         default_outputs = 8 if task == "multilabel" else 1
         output_size = infer_output_size(state, default_outputs)
 
@@ -131,22 +158,26 @@ def load_model(path, task):
 
         result = model.load_state_dict(state, strict=False)
 
-        matched_keys = len(state) - len(result.unexpected_keys)
-        if matched_keys <= 0:
+        if len(state) - len(result.unexpected_keys) <= 0:
             raise RuntimeError(
                 "Checkpoint does not match the configured architecture."
             )
 
     model.to(DEVICE)
     model.eval()
+
     return model
 
 
+# ---------------- PREDICTION ----------------
+
 def run_prediction(model, image, task):
-    x = TRANSFORM(image.convert("RGB")).unsqueeze(0).to(DEVICE)
+    tensor = TRANSFORM(
+        image.convert("RGB")
+    ).unsqueeze(0).to(DEVICE)
 
     with torch.inference_mode():
-        output = model(x)
+        output = model(tensor)
 
     if isinstance(output, (tuple, list)):
         output = output[0]
@@ -154,10 +185,13 @@ def run_prediction(model, image, task):
     if isinstance(output, dict):
         output = output.get(
             "logits",
-            output.get("output", next(iter(output.values())))
+            output.get("output", next(iter(output.values()))),
         )
 
     values = output.detach().float().cpu().reshape(-1).numpy()
+
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Model returned invalid numeric values.")
 
     if task == "regression":
         return float(values[0])
@@ -176,7 +210,7 @@ def run_prediction(model, image, task):
                 1.0 + np.exp(-np.clip(values[0], -50, 50))
             )
         )
-        return {"Class 1": p, "Class 0": 1.0 - p}
+        return {"Class 0": 1.0 - p, "Class 1": p}
 
     values = values - np.max(values)
     exp_values = np.exp(np.clip(values, -50, 50))
@@ -188,28 +222,54 @@ def run_prediction(model, image, task):
     }
 
 
+# ---------------- DISPLAY RESULTS ----------------
+
 def display_result(title, result, task):
     st.subheader(title)
 
     if title == "Retinal Age":
-        st.metric("Estimated Age", f"{float(result):.1f} years")
-
-    elif title == "CIMT Estimate":
-        st.metric("CIMT Model Output", f"{float(result):.4f}")
-        st.caption(
-            "True/False साठी validated threshold आणि units आवश्यक आहेत."
+        st.metric(
+            "Estimated Age",
+            f"{float(result):.1f} years",
         )
 
     elif title == "Retinal Sex":
-        st.write("**Model class scores**")
+        if not isinstance(result, dict) or len(result) < 2:
+            st.error("Sex model did not return two class scores.")
+            return
 
-        if isinstance(result, dict):
-            for label, score in result.items():
-                st.write(f"{label}: {score * 100:.1f}%")
-                st.progress(float(np.clip(score, 0, 1)))
+        scores = list(result.values())
+        predicted_index = int(np.argmax(scores))
+
+        if predicted_index < len(SEX_CLASS_LABELS):
+            predicted_label = SEX_CLASS_LABELS[predicted_index]
+        else:
+            predicted_label = f"Class {predicted_index}"
+
+        st.metric("Predicted Sex", predicted_label)
+
+        for index, score in enumerate(scores):
+            label = (
+                SEX_CLASS_LABELS[index]
+                if index < len(SEX_CLASS_LABELS)
+                else f"Class {index}"
+            )
+            st.write(f"{label}: {score * 100:.1f}%")
+            st.progress(float(np.clip(score, 0, 1)))
 
         st.caption(
-            "Male/Female mapping training labels मधून verify करणे आवश्यक आहे."
+            "Male/Female labels are valid only if they match the "
+            "model's original training class order."
+        )
+
+    elif title == "CIMT Estimate":
+        st.metric(
+            "CIMT Model Output",
+            f"{float(result):.4f}",
+        )
+        st.caption(
+            "Confirm the output units and validated threshold before "
+            "interpreting the value clinically."
         )
 
     elif title == "Retinal Disease":
@@ -227,89 +287,119 @@ def display_result(title, result, task):
             st.progress(score)
 
         st.caption(
-            "हे model scores आहेत; confirmed diagnosis नाही."
+            "These are model scores, not confirmed diagnoses. "
+            "Validated thresholds are needed for Positive/Negative labels."
         )
 
 
+# ---------------- SIDEBAR ----------------
+
 st.sidebar.title("👁️ Retina AI")
 st.sidebar.write("Research Prediction Dashboard")
-st.sidebar.subheader("Model Files")
-
-for model_name, (filename, _) in MODEL_FILES.items():
-    if (MODEL_DIR / filename).exists():
-        st.sidebar.success(f"{model_name}: File found")
-    else:
-        st.sidebar.error(f"{model_name}: File missing")
-
 st.sidebar.caption(f"Device: {DEVICE}")
 
+st.sidebar.subheader("Model Files")
+
+for name, (filename, _) in MODEL_FILES.items():
+    if (MODEL_DIR / filename).exists():
+        st.sidebar.success(f"{name}: Found")
+    else:
+        st.sidebar.error(f"{name}: Missing")
+
+
+# ---------------- MAIN APP ----------------
+
 st.title("👁️ Retina AI Research Dashboard")
-st.write("Upload a retinal/fundus image to run the available models.")
+st.write("Take a photo using your camera or upload a retinal image.")
 
 st.warning(
-    "Research use only. हे app वैद्यकीय निदानाचा पर्याय नाही."
+    "Research use only. Predictions are not a medical diagnosis "
+    "and should not be used to make treatment decisions."
 )
 
-uploaded_file = st.file_uploader(
-    "Upload retinal image",
-    type=["jpg", "jpeg", "png"],
+
+# ---------------- CAMERA / UPLOAD ----------------
+
+source = st.radio(
+    "Choose image source",
+    ["📷 Take Photo", "🖼️ Upload Image"],
+    horizontal=True,
 )
 
-if uploaded_file is not None:
-    try:
-        image = Image.open(uploaded_file).convert("RGB")
+image = None
 
-        left, right = st.columns(2)
+if source == "📷 Take Photo":
+    camera_photo = st.camera_input(
+        "Take a retinal photo",
+        key="retina_camera",
+    )
 
-        with left:
-            st.image(
-                image,
-                caption="Uploaded retinal image",
-                use_container_width=True,
-            )
-
-        with right:
-            st.subheader("Image Information")
-            st.write(f"Width: {image.width} px")
-            st.write(f"Height: {image.height} px")
-            st.write(f"Device: {DEVICE}")
-
-        if st.button(
-            "Run Predictions",
-            type="primary",
-            use_container_width=True,
-        ):
-            st.divider()
-            st.header("Prediction Results")
-
-            for model_name, (filename, task) in MODEL_FILES.items():
-                with st.expander(model_name, expanded=True):
-                    try:
-                        with st.spinner(f"Running {model_name}..."):
-                            model = load_model(
-                                str(MODEL_DIR / filename),
-                                task,
-                            )
-                            result = run_prediction(model, image, task)
-
-                        display_result(model_name, result, task)
-
-                    except Exception as error:
-                        st.error(f"{model_name} failed: {error}")
-
-            st.divider()
-            st.subheader("Additional Predictions")
-            st.info(
-                "CAD/Heart Disease आणि CAP grade साठी स्वतंत्र trained "
-                "models आणि validated mappings configure केलेले नाहीत."
-            )
-
-    except Exception as error:
-        st.error(f"Image processing failed: {error}")
+    if camera_photo is not None:
+        image = Image.open(camera_photo).convert("RGB")
 
 else:
-    st.info("Upload a retinal image to get started.")
-    st.subheader("Available Models")
+    uploaded_file = st.file_uploader(
+        "Upload retinal image",
+        type=["jpg", "jpeg", "png"],
+    )
 
-    for model_name in MODEL_FILES:
-        st.write(f"• {model_name}")
+    if uploaded_file is not None:
+        image = Image.open(uploaded_file).convert("RGB")
+
+
+# ---------------- RUN PREDICTIONS ----------------
+
+if image is not None:
+    left, right = st.columns(2)
+
+    with left:
+        st.image(
+            image,
+            caption="Selected retinal image",
+            use_container_width=True,
+        )
+
+    with right:
+        st.subheader("Image Information")
+        st.write(f"Width: {image.width} px")
+        st.write(f"Height: {image.height} px")
+
+    if st.button(
+        "🔍 Run Predictions",
+        type="primary",
+        use_container_width=True,
+    ):
+        st.divider()
+        st.header("Prediction Results")
+
+        for model_name, (filename, task) in MODEL_FILES.items():
+            with st.expander(model_name, expanded=True):
+                try:
+                    with st.spinner(f"Running {model_name}..."):
+                        model = load_model(
+                            str(MODEL_DIR / filename),
+                            task,
+                        )
+                        result = run_prediction(model, image, task)
+
+                    display_result(model_name, result, task)
+
+                except Exception as error:
+                    st.error(f"{model_name} failed: {error}")
+
+        st.divider()
+        st.subheader("Additional Predictions")
+
+        st.info(
+            "CAD/Heart Disease and CAP grade are not displayed because "
+            "separate trained models and validated output mappings have "
+            "not been configured."
+        )
+
+else:
+    st.info("Choose Take Photo or Upload Image to get started.")
+
+st.sidebar.caption(
+    "Camera access depends on browser permissions. "
+    "Use HTTPS and allow camera access when prompted."
+)
