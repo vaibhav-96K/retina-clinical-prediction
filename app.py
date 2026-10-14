@@ -725,6 +725,51 @@ elif st.session_state.retinal_results:
 
 
 # =====================================================
+# EXTERNAL EYE PHOTO — MOBILE CAMERA
+# =====================================================
+
+st.divider()
+st.header("📱 External Eye Photo")
+
+st.write(
+    "मोबाइलच्या camera ने डोळ्याचा बाहेरून फोटो काढा. "
+    "हा retinal किंवा fundus photo पेक्षा वेगळा प्रकार आहे."
+)
+
+external_eye_photo = st.camera_input(
+    "📷 Capture your eye photo",
+    key="external_eye_camera",
+)
+
+if external_eye_photo is not None:
+    try:
+        external_eye_image = Image.open(
+            external_eye_photo
+        ).convert("RGB")
+
+        st.image(
+            external_eye_image,
+            caption="Captured External Eye Photo",
+            use_container_width=True,
+        )
+
+        st.success("डोळ्याचा फोटो यशस्वीपणे capture झाला.")
+
+        with st.expander("Image Information"):
+            st.write(f"Width: {external_eye_image.width} px")
+            st.write(f"Height: {external_eye_image.height} px")
+
+        st.info(
+            "External-eye AI model अजून जोडलेला नाही. "
+            "या फोटोवरून prediction देण्यासाठी या प्रकारच्या "
+            "फोटोंवर प्रशिक्षित आणि validated model आवश्यक आहे."
+        )
+
+    except Exception as error:
+        st.error(f"डोळ्याचा फोटो उघडता आला नाही: {error}")
+
+
+# =====================================================
 # CIMT CLASSIFICATION — FIRST
 # =====================================================
 
