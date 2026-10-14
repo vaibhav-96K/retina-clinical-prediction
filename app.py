@@ -492,22 +492,21 @@ def display_risk_prediction(image):
                 age_mean, age_std,
             )
 
-        idx = int(np.argmax(probs))
-        col1, col2 = st.columns(2)
+        # =====================================================
+        # RISK LEVEL DISPLAY - HIGH / MEDIUM / LOW ONLY
+        # =====================================================
 
-        col1.metric("Predicted Dataset Class", f"Class {idx}")
-        col2.metric("Selected Class Score", f"{probs[idx]:.1%}")
+        risk_score = float(probs[1]) * 100
 
-        left, right = st.columns(2)
-        left.write(f"**Class 0:** {probs[0]:.1%}")
-        left.progress(float(np.clip(probs[0], 0, 1)))
-        right.write(f"**Class 1:** {probs[1]:.1%}")
-        right.progress(float(np.clip(probs[1], 0, 1)))
+        if risk_score >= 70:
+            risk_level = "High"
+        elif risk_score >= 40:
+            risk_level = "Medium"
+        else:
+            risk_level = "Low"
 
-        st.warning(
-            "Experimental score only. Confirm class meanings and "
-            "gender encoding. This is not a validated clinical risk."
-        )
+        st.subheader("Risk Assessment")
+        st.metric("Risk Level", risk_level)
 
     except Exception as error:
         st.error(
@@ -680,8 +679,7 @@ for name, (filename, _) in MODEL_FILES.items():
 
 st.sidebar.subheader("Clinical Models")
 
-# FIXED: use normal if/else statements so DeltaGenerator
-# objects are not accidentally displayed in the dashboard.
+# Fixed: regular if/else prevents DeltaGenerator text appearing.
 
 if CAD_MODEL_PATH.exists():
     st.sidebar.success("CAD model: Found")
