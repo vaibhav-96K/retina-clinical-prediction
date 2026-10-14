@@ -1,3 +1,4 @@
+
 import os
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import torch.nn as nn
 from torchvision import models, transforms
 
 
-# ---------------- PAGE SETTINGS ----------------
+# ==================== PAGE SETTINGS ====================
 
 st.set_page_config(
     page_title="Retina AI Dashboard",
@@ -31,7 +32,7 @@ div[data-testid="stMetric"] {
 """, unsafe_allow_html=True)
 
 
-# ---------------- MODEL SETTINGS ----------------
+# ==================== CONFIGURATION ====================
 
 PROJECT_DIR = Path(__file__).resolve().parent
 MODEL_DIR = PROJECT_DIR / "models"
@@ -57,13 +58,14 @@ DISEASE_LABELS = [
     "Other",
 ]
 
-# IMPORTANT:
-# Change this only after checking the original training labels.
-# This example assumes class 0 = Female and class 1 = Male.
+# Verify these labels against the original training notebook.
 SEX_CLASS_LABELS = ["Female", "Male"]
 
+# Temporary UI threshold only; validate before clinical interpretation.
+DIABETES_THRESHOLD = 0.50
 
-# ---------------- IMAGE TRANSFORM ----------------
+
+# ==================== IMAGE TRANSFORM ====================
 
 TRANSFORM = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
@@ -75,7 +77,7 @@ TRANSFORM = transforms.Compose([
 ])
 
 
-# ---------------- MODEL HELPERS ----------------
+# ==================== MODEL LOADING ====================
 
 def extract_state_dict(checkpoint):
     if isinstance(checkpoint, nn.Module):
@@ -90,10 +92,9 @@ def extract_state_dict(checkpoint):
             "weights",
         ):
             if isinstance(checkpoint.get(key), dict):
-                checkpoint = checkpoint[key]
-                break
+                return checkpoint[key]
 
-        if isinstance(checkpoint, dict):
+        if checkpoint and all(torch.is_tensor(v) for v in checkpoint.values()):
             return checkpoint
 
     raise ValueError("Unsupported checkpoint format.")
@@ -115,20 +116,15 @@ def clean_state_dict(state):
 
 
 def infer_output_size(state, default):
-    candidates = []
+    for key in (
+        "classifier.1.weight",
+        "classifier.weight",
+        "fc.weight",
+    ):
+        if key in state and state[key].ndim == 2:
+            return int(state[key].shape[0])
 
-    for key, value in state.items():
-        if (
-            value.ndim == 2
-            and key.endswith((
-                "classifier.1.weight",
-                "classifier.weight",
-                "fc.weight",
-            ))
-        ):
-            candidates.append((len(key), int(value.shape[0])))
-
-    return sorted(candidates)[0][1] if candidates else default
+    return default
 
 
 @st.cache_resource(show_spinner=False)
@@ -156,20 +152,15 @@ def load_model(path, task):
             output_size,
         )
 
-        result = model.load_state_dict(state, strict=False)
-
-        if len(state) - len(result.unexpected_keys) <= 0:
-            raise RuntimeError(
-                "Checkpoint does not match the configured architecture."
-            )
+        # Do not silently accept a mismatched architecture.
+        model.load_state_dict(state, strict=True)
 
     model.to(DEVICE)
     model.eval()
-
     return model
 
 
-# ---------------- PREDICTION ----------------
+# ==================== PREDICTION ====================
 
 def run_prediction(model, image, task):
     tensor = TRANSFORM(
@@ -183,10 +174,12 @@ def run_prediction(model, image, task):
         output = output[0]
 
     if isinstance(output, dict):
-        output = output.get(
-            "logits",
-            output.get("output", next(iter(output.values()))),
-        )
+        if "logits" in output:
+            output = output["logits"]
+        elif "output" in output:
+            output = output["output"]
+        else:
+            output = next(iter(output.values()))
 
     values = output.detach().float().cpu().reshape(-1).numpy()
 
@@ -197,6 +190,8 @@ def run_prediction(model, image, task):
         return float(values[0])
 
     if task == "multilabel":
+        # If outputs already resemble probabilities, retain them;
+        # otherwise apply sigmoid.
         if np.all((values >= 0) & (values <= 1)):
             return values
 
@@ -212,8 +207,8 @@ def run_prediction(model, image, task):
         )
         return {"Class 0": 1.0 - p, "Class 1": p}
 
-    values = values - np.max(values)
-    exp_values = np.exp(np.clip(values, -50, 50))
+    shifted = values - np.max(values)
+    exp_values = np.exp(np.clip(shifted, -50, 50))
     probabilities = exp_values / exp_values.sum()
 
     return {
@@ -222,77 +217,81 @@ def run_prediction(model, image, task):
     }
 
 
-# ---------------- DISPLAY RESULTS ----------------
+# ==================== DISPLAY HELPERS ====================
 
-def display_result(title, result, task):
-    st.subheader(title)
+def display_sex(result):
+    if not isinstance(result, dict) or len(result) != 2:
+        st.error("Sex model did not return exactly two class scores.")
+        return
 
-    if title == "Retinal Age":
-        st.metric(
-            "Estimated Age",
-            f"{float(result):.1f} years",
+    scores = list(result.values())
+    predicted_index = int(np.argmax(scores))
+
+    if predicted_index >= len(SEX_CLASS_LABELS):
+        st.error("Sex class mapping is unavailable.")
+        return
+
+    st.metric("Predicted Sex", SEX_CLASS_LABELS[predicted_index])
+    st.caption(
+        "Confirm that Female/Male matches the original training class order."
+    )
+
+
+def display_disease(result):
+    scores = np.asarray(result).reshape(-1)
+
+    if len(scores) != len(DISEASE_LABELS):
+        st.error(
+            f"Expected {len(DISEASE_LABELS)} disease outputs, "
+            f"but model returned {len(scores)}."
         )
+        st.write("Raw model outputs:", scores.tolist())
+        return
 
-    elif title == "Retinal Sex":
-        if not isinstance(result, dict) or len(result) < 2:
-            st.error("Sex model did not return two class scores.")
-            return
+    diabetes_score = float(np.clip(scores[1], 0, 1))
+    diabetes_status = (
+        "Positive"
+        if diabetes_score >= DIABETES_THRESHOLD
+        else "Negative"
+    )
 
-        scores = list(result.values())
-        predicted_index = int(np.argmax(scores))
+    st.metric("Diabetes Model Result", diabetes_status)
+    st.write(f"Diabetes model score: {diabetes_score * 100:.1f}%")
+    st.progress(diabetes_score)
 
-        if predicted_index < len(SEX_CLASS_LABELS):
-            predicted_label = SEX_CLASS_LABELS[predicted_index]
-        else:
-            predicted_label = f"Class {predicted_index}"
+    st.caption(
+        "Experimental output only. The training label order and "
+        "threshold must be validated before interpreting this result."
+    )
 
-        st.metric("Predicted Sex", predicted_label)
-
-        for index, score in enumerate(scores):
-            label = (
-                SEX_CLASS_LABELS[index]
-                if index < len(SEX_CLASS_LABELS)
-                else f"Class {index}"
-            )
-            st.write(f"{label}: {score * 100:.1f}%")
-            st.progress(float(np.clip(score, 0, 1)))
-
-        st.caption(
-            "Male/Female labels are valid only if they match the "
-            "model's original training class order."
-        )
-
-    elif title == "CIMT Estimate":
-        st.metric(
-            "CIMT Model Output",
-            f"{float(result):.4f}",
-        )
-        st.caption(
-            "Confirm the output units and validated threshold before "
-            "interpreting the value clinically."
-        )
-
-    elif title == "Retinal Disease":
-        scores = np.asarray(result).reshape(-1)
-
-        labels = (
-            DISEASE_LABELS
-            if len(scores) == len(DISEASE_LABELS)
-            else [f"Output {i + 1}" for i in range(len(scores))]
-        )
-
-        for label, score in zip(labels, scores):
+    with st.expander("View all retinal disease scores"):
+        for label, score in zip(DISEASE_LABELS, scores):
             score = float(np.clip(score, 0, 1))
             st.write(f"**{label}:** {score * 100:.1f}%")
             st.progress(score)
 
+
+def display_model_result(title, result):
+    st.subheader(title)
+
+    if title == "Retinal Age":
+        st.metric("Estimated Age", f"{float(result):.1f} years")
+
+    elif title == "Retinal Sex":
+        display_sex(result)
+
+    elif title == "Retinal Disease":
+        display_disease(result)
+
+    elif title == "CIMT Estimate":
+        st.metric("CIMT Model Output", f"{float(result):.4f}")
         st.caption(
-            "These are model scores, not confirmed diagnoses. "
-            "Validated thresholds are needed for Positive/Negative labels."
+            "Numeric model output. Units and a validated cutoff are "
+            "needed before converting it to True/False."
         )
 
 
-# ---------------- SIDEBAR ----------------
+# ==================== SIDEBAR ====================
 
 st.sidebar.title("👁️ Retina AI")
 st.sidebar.write("Research Prediction Dashboard")
@@ -307,18 +306,18 @@ for name, (filename, _) in MODEL_FILES.items():
         st.sidebar.error(f"{name}: Missing")
 
 
-# ---------------- MAIN APP ----------------
+# ==================== MAIN APP ====================
 
 st.title("👁️ Retina AI Research Dashboard")
-st.write("Take a photo using your camera or upload a retinal image.")
+st.write("Take a photo or upload a retinal image.")
 
 st.warning(
-    "Research use only. Predictions are not a medical diagnosis "
-    "and should not be used to make treatment decisions."
+    "Research use only. This app does not provide a confirmed medical "
+    "diagnosis. Do not use its outputs to make treatment decisions."
 )
 
 
-# ---------------- CAMERA / UPLOAD ----------------
+# ==================== CAMERA / UPLOAD ====================
 
 source = st.radio(
     "Choose image source",
@@ -344,10 +343,13 @@ else:
     )
 
     if uploaded_file is not None:
-        image = Image.open(uploaded_file).convert("RGB")
+        try:
+            image = Image.open(uploaded_file).convert("RGB")
+        except Exception:
+            st.error("Could not open this image. Please upload a valid image.")
 
 
-# ---------------- RUN PREDICTIONS ----------------
+# ==================== RUN PREDICTIONS ====================
 
 if image is not None:
     left, right = st.columns(2)
@@ -382,22 +384,48 @@ if image is not None:
                         )
                         result = run_prediction(model, image, task)
 
-                    display_result(model_name, result, task)
+                    display_model_result(model_name, result)
 
                 except Exception as error:
                     st.error(f"{model_name} failed: {error}")
 
         st.divider()
-        st.subheader("Additional Predictions")
+        st.header("Additional Predictions")
 
-        st.info(
-            "CAD/Heart Disease and CAP grade are not displayed because "
-            "separate trained models and validated output mappings have "
-            "not been configured."
-        )
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("### CAD / Heart Disease")
+            st.info(
+                "Not configured: no separate trained CAD/heart disease "
+                "model is listed in the current project configuration."
+            )
+
+            st.markdown("### Risk Prediction")
+            st.info(
+                "Not configured: a validated risk model or calibrated "
+                "probability calculation is not available in this code."
+            )
+
+        with col2:
+            st.markdown("### CIMT Classification")
+            st.info(
+                "The current CIMT model returns a numeric value. "
+                "True/False requires verified output units and a validated "
+                "threshold."
+            )
+
+            st.markdown("### CAP Grade")
+            st.info(
+                "Not configured: a CAP grade model and verified grade "
+                "mapping are not listed in the current project."
+            )
 
 else:
     st.info("Choose Take Photo or Upload Image to get started.")
+
+
+# ==================== FOOTER ====================
 
 st.sidebar.caption(
     "Camera access depends on browser permissions. "
