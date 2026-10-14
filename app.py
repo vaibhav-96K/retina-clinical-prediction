@@ -1,4 +1,3 @@
-
 import os
 from pathlib import Path
 
@@ -47,6 +46,7 @@ MODEL_DIR = PROJECT_DIR / "models"
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
+
 IMAGE_SIZE = 224
 
 MODEL_FILES = {
@@ -176,6 +176,7 @@ def load_model(path, task):
 
     model.to(DEVICE)
     model.eval()
+
     return model
 
 
@@ -188,8 +189,6 @@ CAD_MODEL_PATH = MODEL_DIR / CAD_MODEL_FILE
 
 @st.cache_resource(show_spinner=False)
 def load_cad_model(path, modified_time):
-    # The file is a joblib artifact exported by our Colab notebook.
-    # Only load trusted model files.
     artifact = joblib.load(path)
 
     required_keys = {"model", "feature_columns", "classes"}
@@ -206,8 +205,6 @@ def load_cad_model(path, modified_time):
     return artifact
 
 
-# Dataset category codes used during training.
-# Verify these codes against the exact training dataset.
 CAD_CATEGORICAL_OPTIONS = {
     "sex": [0, 1],
     "cp": [1, 2, 3, 4],
@@ -232,9 +229,11 @@ CAD_NUMERIC_RANGES = {
 # CAD CLINICAL INPUT FORM
 # =====================================================
 
-def render_cad_input(feature_columns, numeric_columns,
-                     categorical_columns):
-
+def render_cad_input(
+    feature_columns,
+    numeric_columns,
+    categorical_columns,
+):
     values = {}
 
     st.write(
@@ -255,23 +254,25 @@ def render_cad_input(feature_columns, numeric_columns,
 
             with container:
                 if feature in CAD_CATEGORICAL_OPTIONS:
-                    options = CAD_CATEGORICAL_OPTIONS[feature]
-
                     value = st.selectbox(
                         f"{feature} (dataset code)",
-                        options=options,
+                        options=CAD_CATEGORICAL_OPTIONS[feature],
                         key=f"cad_{feature}",
                     )
 
                 elif feature in CAD_NUMERIC_RANGES:
-                    minimum, maximum, default = CAD_NUMERIC_RANGES[feature]
+                    minimum, maximum, default = (
+                        CAD_NUMERIC_RANGES[feature]
+                    )
 
                     value = st.number_input(
                         feature,
                         min_value=float(minimum),
                         max_value=float(maximum),
                         value=float(default),
-                        step=0.1 if feature == "oldpeak" else 1.0,
+                        step=(
+                            0.1 if feature == "oldpeak" else 1.0
+                        ),
                         key=f"cad_{feature}",
                     )
 
@@ -334,7 +335,8 @@ def display_cad_prediction():
     categorical_columns = artifact.get("categorical_columns", [])
 
     st.caption(
-        f"Loaded clinical model with {len(feature_columns)} input features."
+        f"Loaded clinical model with "
+        f"{len(feature_columns)} input features."
     )
 
     submitted, values = render_cad_input(
@@ -350,19 +352,19 @@ def display_cad_prediction():
         return
 
     try:
-        # Construct input in the exact order saved during training.
         row = pd.DataFrame(
             [[values[col] for col in feature_columns]],
             columns=feature_columns,
         )
 
-        # Match the training data's numeric feature types.
         for col in numeric_columns:
-            row[col] = pd.to_numeric(row[col], errors="raise")
+            row[col] = pd.to_numeric(
+                row[col],
+                errors="raise",
+            )
 
         model = artifact["model"]
         prediction = int(model.predict(row)[0])
-
         classes = artifact["classes"]
 
         if prediction < 0 or prediction >= len(classes):
@@ -380,6 +382,7 @@ def display_cad_prediction():
 
             if len(probabilities) == len(classes):
                 st.write("Class scores:")
+
                 for label, score in zip(classes, probabilities):
                     st.write(f"- {label}: {float(score):.1%}")
 
@@ -438,6 +441,7 @@ def run_prediction(model, image, task):
                 1.0 + np.exp(-np.clip(values[0], -50, 50))
             )
         )
+
         return {
             "Class 0": 1.0 - probability,
             "Class 1": probability,
@@ -465,7 +469,11 @@ def display_sex(result):
         st.error("Sex class mapping is unavailable.")
         return
 
-    st.metric("Predicted Sex", SEX_CLASS_LABELS[predicted_index])
+    st.metric(
+        "Predicted Sex",
+        SEX_CLASS_LABELS[predicted_index],
+    )
+
     st.caption(
         "Confirm Female/Male class order against the training labels."
     )
@@ -510,7 +518,10 @@ def display_model_result(name, result):
     st.subheader(name)
 
     if name == "Retinal Age":
-        st.metric("Estimated Age", f"{float(result):.1f} years")
+        st.metric(
+            "Estimated Age",
+            f"{float(result):.1f} years",
+        )
 
     elif name == "Retinal Sex":
         display_sex(result)
@@ -519,7 +530,11 @@ def display_model_result(name, result):
         display_disease(result)
 
     elif name == "CIMT Estimate":
-        st.metric("Raw CIMT Model Output", f"{float(result):.4f}")
+        st.metric(
+            "Raw CIMT Model Output",
+            f"{float(result):.4f}",
+        )
+
         st.caption(
             "Units have not been verified. Classification is disabled "
             "until units and a validated threshold are confirmed."
@@ -565,7 +580,9 @@ def display_other_additional_predictions():
                 "and verified grade labels are needed."
             )
 
-        st.caption("No CAP grade is generated without a compatible model.")
+        st.caption(
+            "No CAP grade is generated without a compatible model."
+        )
 
 
 # =====================================================
@@ -639,9 +656,13 @@ else:
             st.error("Could not open image. Upload a valid image.")
 
 
-# Save retinal results across Streamlit reruns.
+# =====================================================
+# SAVE RETINAL RESULTS ACROSS RERUNS
+# =====================================================
+
 if "retinal_results" not in st.session_state:
     st.session_state.retinal_results = {}
+
 
 if image is not None:
     image_col, info_col = st.columns(2)
@@ -677,7 +698,12 @@ if image is not None:
                             str(MODEL_DIR / filename),
                             task,
                         )
-                        result = run_prediction(model, image, task)
+
+                        result = run_prediction(
+                            model,
+                            image,
+                            task,
+                        )
 
                     prediction_results[model_name] = result
                     display_model_result(model_name, result)
@@ -687,10 +713,11 @@ if image is not None:
 
         st.session_state.retinal_results = prediction_results
 
-# Show previously saved retinal results after reruns.
 elif st.session_state.retinal_results:
     st.header("Previous Retinal Prediction Results")
-    st.caption("These are the results from the last retinal prediction run.")
+    st.caption(
+        "These are the results from the last retinal prediction run."
+    )
 
     for name, result in st.session_state.retinal_results.items():
         with st.expander(name):
@@ -698,14 +725,8 @@ elif st.session_state.retinal_results:
 
 
 # =====================================================
-# ADDITIONAL PREDICTIONS — ALWAYS AVAILABLE
+# CIMT CLASSIFICATION — FIRST
 # =====================================================
-
-st.divider()
-st.header("Additional Predictions")
-
-# CAD form is independent of retinal image upload.
-display_cad_prediction()
 
 st.divider()
 st.subheader("🩺 CIMT Classification")
@@ -713,18 +734,40 @@ st.subheader("🩺 CIMT Classification")
 cimt_value = st.session_state.retinal_results.get("CIMT Estimate")
 
 if cimt_value is not None:
-    st.metric("Raw CIMT Model Output", f"{float(cimt_value):.4f}")
+    st.metric(
+        "Raw CIMT Model Output",
+        f"{float(cimt_value):.4f}",
+    )
+
     st.warning(
         "Units and a validated cutoff are unknown. "
-        "True/False classification is disabled."
+        "True/False classification is disabled until "
+        "the model units and clinical threshold are verified."
     )
 else:
     st.info(
-        "Run a retinal prediction to display the existing raw CIMT output."
+        "Run a retinal prediction to display the existing "
+        "raw CIMT model output."
     )
 
+
+# =====================================================
+# ADDITIONAL PREDICTIONS — AFTER CIMT
+# =====================================================
+
 st.divider()
+st.header("Additional Predictions")
+
+display_cad_prediction()
+
+st.divider()
+
 display_other_additional_predictions()
+
+
+# =====================================================
+# FOOTER
+# =====================================================
 
 st.caption(
     "Research prototype only. Not validated for clinical diagnosis."
