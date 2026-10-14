@@ -679,9 +679,24 @@ for name, (filename, _) in MODEL_FILES.items():
         st.sidebar.error(f"{name}: Missing")
 
 st.sidebar.subheader("Clinical Models")
-st.sidebar.success("CAD model: Found") if CAD_MODEL_PATH.exists() else st.sidebar.info("CAD model: Not found")
-st.sidebar.success("Risk Prediction: Found") if RISK_MODEL_PATH.exists() else st.sidebar.info("Risk Prediction: Not found")
-st.sidebar.success("CAP Grade: Found") if CAP_MODEL_PATH.exists() else st.sidebar.info("CAP Grade: Not found")
+
+# FIXED: use normal if/else statements so DeltaGenerator
+# objects are not accidentally displayed in the dashboard.
+
+if CAD_MODEL_PATH.exists():
+    st.sidebar.success("CAD model: Found")
+else:
+    st.sidebar.info("CAD model: Not found")
+
+if RISK_MODEL_PATH.exists():
+    st.sidebar.success("Risk Prediction: Found")
+else:
+    st.sidebar.info("Risk Prediction: Not found")
+
+if CAP_MODEL_PATH.exists():
+    st.sidebar.success("CAP Grade: Found")
+else:
+    st.sidebar.info("CAP Grade: Not found")
 
 
 # =====================================================
