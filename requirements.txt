@@ -3,3 +3,6 @@ numpy
 Pillow
 torch
 torchvision
+pandas
+joblib
+scikit-learn
