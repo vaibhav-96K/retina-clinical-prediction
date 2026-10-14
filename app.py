@@ -304,6 +304,9 @@ if uploaded_file is not None:
                 "models आणि validated mappings configure केलेले नाहीत."
             )
 
+    except Exception as error:
+        st.error(f"Image processing failed: {error}")
+
 else:
     st.info("Upload a retinal image to get started.")
     st.subheader("Available Models")
