@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import joblib
 from PIL import Image
+import tensorflow as tf
 
 import torch
 import torch.nn as nn
@@ -67,19 +68,11 @@ DIABETES_THRESHOLD = 0.50
 CAD_MODEL_PATH = MODEL_DIR / "cad_heart_disease_model.joblib"
 CAP_MODEL_PATH = MODEL_DIR / "cap_grade_model.pth"
 
-RISK_CANDIDATES = [
-    MODEL_DIR / "risk_prediction_model.pth",
-    PROJECT_DIR / "risk_prediction_model.pth",
-    Path(
-        "/content/drive/MyDrive/retinal and clinical project 1/"
-        "risk_prediction_model.pth"
-    ),
-]
-
-RISK_MODEL_PATH = next(
-    (p for p in RISK_CANDIDATES if p.exists()),
-    RISK_CANDIDATES[0],
+# Keras retinal + clinical feature-fusion model and its scaler.
+FUSION_MODEL_PATH = (
+    MODEL_DIR / "retinal_feature_fusion_model_FINAL.keras"
 )
+CLINICAL_SCALER_PATH = MODEL_DIR / "clinical_scaler.pkl"
 
 TRANSFORM = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
@@ -279,246 +272,261 @@ def display_model_result(name, result):
 
 
 # =====================================================
-# RISK PREDICTION MODEL
+# KERAS RETINAL + CLINICAL RISK FUSION MODEL
 # =====================================================
-
-class RiskFusionModel(nn.Module):
-    def __init__(
-        self,
-        image_name="backbone",
-        clinical_name="clinical_encoder",
-        head_name="head",
-    ):
-        super().__init__()
-
-        backbone = models.efficientnet_b0(weights=None)
-        backbone.classifier = nn.Identity()
-
-        clinical = nn.Sequential(
-            nn.Linear(2, 16),
-            nn.ReLU(),
-        )
-
-        head = nn.Sequential(
-            nn.Linear(1296, 128),
-            nn.ReLU(),
-            nn.Dropout(p=0.3),
-            nn.Linear(128, 2),
-        )
-
-        setattr(self, image_name, backbone)
-        setattr(self, clinical_name, clinical)
-        setattr(self, head_name, head)
-
-        self.image_name = image_name
-        self.clinical_name = clinical_name
-        self.head_name = head_name
-
-    def forward(self, image, clinical):
-        image_features = getattr(
-            self, self.image_name
-        )(image)
-
-        clinical_features = getattr(
-            self, self.clinical_name
-        )(clinical)
-
-        combined = torch.cat(
-            [image_features, clinical_features], dim=1
-        )
-
-        return getattr(self, self.head_name)(combined)
-
-
-DEFAULT_AGE_MEAN = 48.032730404823425
-DEFAULT_AGE_STD = 12.87410690819793
-
 
 @st.cache_resource(show_spinner=False)
-def load_risk_model(path, modified_time):
-    checkpoint = torch.load(
-        path, map_location="cpu", weights_only=False
-    )
+def load_fusion_artifacts(
+    model_path,
+    model_mtime,
+    scaler_path,
+    scaler_mtime
+):
+    """Load the trained Keras fusion model and matching scaler."""
 
-    if isinstance(checkpoint, nn.Module):
-        return (
-            checkpoint.to(DEVICE).eval(),
-            DEFAULT_AGE_MEAN,
-            DEFAULT_AGE_STD,
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(
+            f"Fusion model file missing: {model_path}"
         )
 
-    if not isinstance(checkpoint, dict):
-        raise ValueError("Invalid risk checkpoint format.")
+    if not os.path.isfile(scaler_path):
+        raise FileNotFoundError(
+            f"Clinical scaler file missing: {scaler_path}"
+        )
 
-    state = checkpoint
-    for key in ("model_state_dict", "state_dict", "model"):
-        if isinstance(checkpoint.get(key), dict):
-            state = checkpoint[key]
-            break
-
-    state = clean_state_dict(state)
-
-    age_mean = float(
-        checkpoint.get("age_mean", DEFAULT_AGE_MEAN)
-    )
-    age_std = float(
-        checkpoint.get("age_std", DEFAULT_AGE_STD)
+    fusion_model = tf.keras.models.load_model(
+        model_path,
+        compile=False
     )
 
-    if age_std <= 0:
-        raise ValueError("Invalid age standard deviation.")
+    # Only load pickle files from a trusted source.
+    clinical_scaler = joblib.load(scaler_path)
 
-    model = None
-    last_error = None
+    expected_features = list(
+        getattr(
+            clinical_scaler,
+            "feature_names_in_",
+            ["gender", "thickness", "age"]
+        )
+    )
 
-    for image_name in (
-        "backbone", "image_backbone",
-        "image_model", "image_encoder", "efficientnet"
-    ):
-        for clinical_name in (
-            "clinical_encoder", "clinical_net",
-            "clinical_model", "clinical_mlp"
-        ):
-            for head_name in (
-                "head", "classifier", "risk_head", "fusion_head"
-            ):
-                candidate = RiskFusionModel(
-                    image_name, clinical_name, head_name
+    if expected_features != ["gender", "thickness", "age"]:
+        raise ValueError(
+            "Scaler feature order mismatch. Expected "
+            "['gender', 'thickness', 'age'], found "
+            f"{expected_features}. Use the scaler from training."
+        )
+
+    if getattr(clinical_scaler, "n_features_in_", 3) != 3:
+        raise ValueError(
+            "Clinical scaler must accept exactly 3 features."
+        )
+
+    if len(fusion_model.inputs) != 2:
+        raise ValueError(
+            "Expected two model inputs: image and clinical data."
+        )
+
+    return fusion_model, clinical_scaler
+
+
+def predict_fusion_risk(
+    model,
+    scaler,
+    image,
+    gender_code,
+    thickness,
+    age
+):
+    """Run fusion prediction with the training feature order."""
+
+    # The Keras model has internal Rescaling/Normalization layers.
+    # Resize to 224x224, but do not apply PyTorch normalization here.
+    resized = image.convert("RGB").resize((224, 224))
+
+    image_array = np.asarray(
+        resized,
+        dtype=np.float32
+    )
+
+    image_batch = np.expand_dims(image_array, axis=0)
+
+    clinical_frame = pd.DataFrame(
+        [[
+            float(gender_code),
+            float(thickness),
+            float(age)
+        ]],
+        columns=["gender", "thickness", "age"],
+    )
+
+    clinical_scaled = scaler.transform(
+        clinical_frame
+    ).astype(np.float32)
+
+    outputs = model.predict(
+        [image_batch, clinical_scaled],
+        verbose=0
+    )
+
+    if isinstance(outputs, (list, tuple)):
+        if len(outputs) != 1:
+            raise ValueError(
+                "Fusion model returned multiple outputs unexpectedly."
+            )
+        outputs = outputs[0]
+
+    values = np.asarray(
+        outputs,
+        dtype=np.float32
+    ).reshape(-1)
+
+    if values.size != 1 or not np.all(np.isfinite(values)):
+        raise ValueError(
+            "Expected one finite binary-classification output; "
+            f"received {values}."
+        )
+
+    raw_score = float(values[0])
+
+    # The model's output is expected to be a sigmoid score.
+    # If it is outside [0,1], treat it as a logit.
+    if 0.0 <= raw_score <= 1.0:
+        score = raw_score
+    else:
+        score = float(
+            1.0 / (
+                1.0 + np.exp(
+                    -np.clip(raw_score, -50, 50)
                 )
-                try:
-                    candidate.load_state_dict(state, strict=True)
-                    model = candidate
-                    break
-                except Exception as error:
-                    last_error = error
-
-            if model is not None:
-                break
-        if model is not None:
-            break
-
-    if model is None:
-        raise RuntimeError(
-            f"Risk checkpoint architecture mismatch: {last_error}"
+            )
         )
 
-    return model.to(DEVICE).eval(), age_mean, age_std
+    return float(np.clip(score, 0.0, 1.0))
 
-
-def predict_risk(model, image, age, gender_code, age_mean, age_std):
-    x = TRANSFORM(
-        image.convert("RGB")
-    ).unsqueeze(0).to(DEVICE)
-
-    normalized_age = (float(age) - age_mean) / age_std
-
-    clinical = torch.tensor(
-        [[normalized_age, float(gender_code)]],
-        dtype=torch.float32,
-        device=DEVICE,
-    )
-
-    with torch.inference_mode():
-        logits = model(x, clinical)
-
-        if isinstance(logits, (tuple, list)):
-            logits = logits[0]
-
-        if isinstance(logits, dict):
-            logits = logits.get("logits", logits.get("output"))
-
-        if logits is None:
-            raise ValueError("Risk model returned no logits.")
-
-        probabilities = torch.softmax(
-            logits.float().reshape(1, -1), dim=1
-        )[0].cpu().numpy()
-
-    if len(probabilities) != 2 or not np.all(
-        np.isfinite(probabilities)
-    ):
-        raise ValueError("Risk model returned invalid scores.")
-
-    return probabilities
-
-
-# =====================================================
-# UPDATED RISK PREDICTION DISPLAY
-# Age/Gender fields removed; prediction runs automatically.
-# IMPORTANT: hidden defaults are used by the existing model.
-# =====================================================
 
 def display_risk_prediction(image):
     st.subheader("📊 Risk Prediction")
 
-    if not RISK_MODEL_PATH.exists():
+    if not FUSION_MODEL_PATH.exists():
         st.info(
-            "Risk model missing. Put risk_prediction_model.pth "
-            "in the models folder or configured Drive path."
+            "Fusion model missing. Add "
+            "models/retinal_feature_fusion_model_FINAL.keras."
+        )
+        return
+
+    if not CLINICAL_SCALER_PATH.exists():
+        st.info(
+            "Clinical scaler missing. Add "
+            "models/clinical_scaler.pkl."
+        )
+        return
+
+    st.caption(
+        "Enter clinical features using the same gender encoding "
+        "and thickness units used during model training."
+    )
+
+    with st.form("fusion_risk_form"):
+        gender_code = st.selectbox(
+            "Gender code used during training",
+            options=[0, 1],
+            format_func=lambda value: f"Code {value}",
+            help=(
+                "Choose the same 0/1 encoding used in the training dataset."
+            ),
+        )
+
+        thickness = st.number_input(
+            "Thickness (same units as training data)",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.0,
+            step=0.1,
+            help=(
+                "Enter thickness in the same units and range used "
+                "when the model was trained."
+            ),
+        )
+
+        age = st.number_input(
+            "Age (years)",
+            min_value=1,
+            max_value=120,
+            value=50,
+            step=1,
+        )
+
+        submitted = st.form_submit_button(
+            "❤️ Run Heart Disease Risk Classification",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if not submitted:
+        st.info(
+            "Select a retinal image, enter clinical features, "
+            "and click the prediction button."
         )
         return
 
     if image is None:
-        st.info("Upload or capture a retinal image first.")
-        return
-
-    # Avoid repeating the same risk prediction on every Streamlit rerun.
-    image_key = st.session_state.get("current_risk_image_key")
-
-    if image_key is None:
-        st.info("Select a retinal image to run Risk Prediction.")
-        return
-
-    if (
-        st.session_state.get("risk_result_image_key") == image_key
-        and st.session_state.get("risk_result_level") is not None
-    ):
-        st.subheader("Risk Assessment")
-        st.metric(
-            "Risk Level",
-            st.session_state.risk_result_level,
+        st.warning(
+            "Upload or capture a retinal/fundus image before "
+            "running risk prediction."
         )
         return
 
     try:
-        with st.spinner("Running Risk Prediction..."):
-            model, age_mean, age_std = load_risk_model(
-                str(RISK_MODEL_PATH),
-                RISK_MODEL_PATH.stat().st_mtime,
+        with st.spinner(
+            "Running retinal + clinical fusion model..."
+        ):
+            model, scaler = load_fusion_artifacts(
+                str(FUSION_MODEL_PATH),
+                FUSION_MODEL_PATH.stat().st_mtime,
+                str(CLINICAL_SCALER_PATH),
+                CLINICAL_SCALER_PATH.stat().st_mtime,
             )
 
-            # Hidden default values for the existing image + clinical model.
-            # These do NOT make this a true image-only prediction.
-            assumed_age = age_mean
-            assumed_gender_code = 0
-
-            probs = predict_risk(
-                model,
-                image,
-                assumed_age,
-                assumed_gender_code,
-                age_mean,
-                age_std,
+            risk_score = predict_fusion_risk(
+                model=model,
+                scaler=scaler,
+                image=image,
+                gender_code=gender_code,
+                thickness=thickness,
+                age=age,
             )
 
-        risk_score = float(probs[1]) * 100
+        risk_level = (
+            "High" if risk_score >= 0.5 else "Low"
+        )
 
-        if risk_score >= 70:
-            risk_level = "High"
-        elif risk_score >= 40:
-            risk_level = "Medium"
-        else:
-            risk_level = "Low"
+        result_col1, result_col2 = st.columns(2)
 
-        st.session_state.risk_result_image_key = image_key
-        st.session_state.risk_result_level = risk_level
+        with result_col1:
+            st.metric(
+                "Predicted Risk Class",
+                risk_level
+            )
 
-        st.subheader("Risk Assessment")
-        st.metric("Risk Level", risk_level)
+        with result_col2:
+            st.metric(
+                "Model Score",
+                f"{risk_score:.1%}"
+            )
+
+        st.progress(risk_score)
+
+        st.caption(
+            "Research output from the trained model, not a confirmed "
+            "diagnosis. The score is not a calibrated clinical probability "
+            "unless calibration was validated."
+        )
 
     except Exception as error:
         st.error(
-            f"Risk Prediction failed: {type(error).__name__}: {error}"
+            f"Fusion risk prediction failed: "
+            f"{type(error).__name__}: {error}"
         )
 
 
@@ -554,8 +562,11 @@ def load_cad_model(path, modified_time):
         raise ValueError("CAD artifact must be a dictionary.")
 
     missing = {"model", "feature_columns", "classes"} - set(artifact)
+
     if missing:
-        raise ValueError(f"CAD artifact missing: {sorted(missing)}")
+        raise ValueError(
+            f"CAD artifact missing: {sorted(missing)}"
+        )
 
     if not artifact["feature_columns"]:
         raise ValueError("CAD feature_columns is empty.")
@@ -599,8 +610,10 @@ def display_cad_prediction():
                         CAD_CATEGORICAL_OPTIONS[feature],
                         key=f"cad_{feature}",
                     )
+
                 elif feature in CAD_NUMERIC_RANGES:
                     lo, hi, default = CAD_NUMERIC_RANGES[feature]
+
                     value = st.number_input(
                         feature,
                         min_value=float(lo),
@@ -609,10 +622,14 @@ def display_cad_prediction():
                         step=0.1 if feature == "oldpeak" else 1.0,
                         key=f"cad_{feature}",
                     )
+
                 elif feature in numeric:
                     value = st.number_input(
-                        feature, value=0.0, key=f"cad_{feature}"
+                        feature,
+                        value=0.0,
+                        key=f"cad_{feature}"
                     )
+
                 else:
                     value = st.text_input(
                         f"{feature} (category/code)",
@@ -637,23 +654,33 @@ def display_cad_prediction():
         )
 
         for col in numeric:
-            row[col] = pd.to_numeric(row[col], errors="raise")
+            row[col] = pd.to_numeric(
+                row[col],
+                errors="raise"
+            )
 
         model = artifact["model"]
         prediction = int(model.predict(row)[0])
         classes = artifact["classes"]
 
         if prediction < 0 or prediction >= len(classes):
-            raise ValueError("Prediction does not match saved class mapping.")
+            raise ValueError(
+                "Prediction does not match saved class mapping."
+            )
 
-        st.write(f"**Predicted class:** {classes[prediction]}")
+        st.write(
+            f"**Predicted class:** {classes[prediction]}"
+        )
 
         if hasattr(model, "predict_proba"):
             scores = model.predict_proba(row)[0]
+
             for label, score in zip(classes, scores):
                 st.write(f"- {label}: {float(score):.1%}")
 
-        st.warning("Research prototype only; not a diagnosis.")
+        st.warning(
+            "Research prototype only; not a diagnosis."
+        )
 
     except Exception as error:
         st.error(f"CAD prediction failed: {error}")
@@ -701,10 +728,15 @@ if CAD_MODEL_PATH.exists():
 else:
     st.sidebar.info("CAD model: Not found")
 
-if RISK_MODEL_PATH.exists():
-    st.sidebar.success("Risk Prediction: Found")
+if FUSION_MODEL_PATH.exists():
+    st.sidebar.success("Fusion Risk Model: Found")
 else:
-    st.sidebar.info("Risk Prediction: Not found")
+    st.sidebar.info("Fusion Risk Model: Not found")
+
+if CLINICAL_SCALER_PATH.exists():
+    st.sidebar.success("Clinical Scaler: Found")
+else:
+    st.sidebar.info("Clinical Scaler: Not found")
 
 if CAP_MODEL_PATH.exists():
     st.sidebar.success("CAP Grade: Found")
@@ -721,12 +753,15 @@ st.caption(
     "Upload a retinal image, capture a retinal image, "
     "or capture an external eye photo."
 )
-st.warning("For research use only. Not a confirmed diagnosis.")
+st.warning(
+    "For research use only. Not a confirmed diagnosis."
+)
 
 upload_col, retina_col, external_col = st.columns(3)
 
 with upload_col:
     st.subheader("🖼️ Upload Image")
+
     uploaded_file = st.file_uploader(
         "Choose retinal image",
         type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"],
@@ -735,6 +770,7 @@ with upload_col:
 
 with retina_col:
     st.subheader("📷 Retina Camera")
+
     camera_photo = st.camera_input(
         "Capture retinal/fundus image",
         key="retina_camera",
@@ -742,6 +778,7 @@ with retina_col:
 
 with external_col:
     st.subheader("👁️ External Eye Photo")
+
     external_eye_photo = st.camera_input(
         "Capture external eye",
         key="external_eye_camera",
@@ -755,10 +792,12 @@ try:
         raw = uploaded_file.getvalue()
         image = Image.open(uploaded_file).convert("RGB")
         image_key = str(hash(raw))
+
     elif camera_photo is not None:
         raw = camera_photo.getvalue()
         image = Image.open(camera_photo).convert("RGB")
         image_key = str(hash(raw))
+
 except Exception as error:
     st.error(f"Could not open retinal image: {error}")
 
@@ -783,6 +822,7 @@ if image is not None:
 
     with image_col:
         st.subheader("Selected Retinal Image")
+
         st.image(
             image,
             caption="Retinal / Fundus Image",
@@ -819,11 +859,17 @@ if image is not None:
                     path = MODEL_DIR / filename
 
                     model = load_model(
-                        str(path), task,
+                        str(path),
+                        task,
                         path.stat().st_mtime if path.exists() else 0,
                     )
 
-                    result = run_prediction(model, image, task)
+                    result = run_prediction(
+                        model,
+                        image,
+                        task
+                    )
+
                     results[name] = result
                     display_model_result(name, result)
 
@@ -834,6 +880,7 @@ if image is not None:
 
 elif st.session_state.retinal_results:
     st.header("Previous Retinal Prediction Results")
+
     for name, result in st.session_state.retinal_results.items():
         with st.expander(name):
             display_model_result(name, result)
@@ -866,7 +913,9 @@ if external_eye_photo is not None:
             use_container_width=True,
         )
 
-        st.success("External eye photo captured successfully.")
+        st.success(
+            "External eye photo captured successfully."
+        )
         st.write(f"Width: {external_image.width} px")
         st.write(f"Height: {external_image.height} px")
 
@@ -876,7 +925,9 @@ if external_eye_photo is not None:
         )
 
     except Exception as error:
-        st.error(f"Could not open external eye photo: {error}")
+        st.error(
+            f"Could not open external eye photo: {error}"
+        )
 
 
 # =====================================================
@@ -886,16 +937,25 @@ if external_eye_photo is not None:
 st.divider()
 st.subheader("🩺 CIMT Classification")
 
-cimt_value = st.session_state.retinal_results.get("CIMT Estimate")
+cimt_value = st.session_state.retinal_results.get(
+    "CIMT Estimate"
+)
 
 if cimt_value is not None:
-    st.metric("Raw CIMT Model Output", f"{float(cimt_value):.4f}")
+    st.metric(
+        "Raw CIMT Model Output",
+        f"{float(cimt_value):.4f}"
+    )
+
     st.warning(
         "Units and validated cutoff are unknown. "
         "Clinical classification is disabled."
     )
+
 else:
-    st.info("Run retinal predictions to display CIMT output.")
+    st.info(
+        "Run retinal predictions to display CIMT output."
+    )
 
 
 # =====================================================
@@ -913,6 +973,7 @@ if CAP_MODEL_PATH.exists():
         "CAP model file exists, but its architecture and grade "
         "mapping are not configured."
     )
+
 else:
     st.info(
         "A compatible trained CAP model and verified grade labels "
