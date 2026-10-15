@@ -15,7 +15,9 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import joblib
-from PIL import Image, ImageOps
+from PIL import Image
+import io
+import hashlib
 
 import torch
 import torch.nn as nn
