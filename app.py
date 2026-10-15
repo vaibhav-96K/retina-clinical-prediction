@@ -870,4 +870,3 @@ st.caption(
     "Retina AI Research Prediction Dashboard | Academic research use only. "
     "Predictions are not a substitute for professional medical evaluation."
 )
-```
