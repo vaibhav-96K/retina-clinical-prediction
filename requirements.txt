@@ -1,9 +1,9 @@
 streamlit
 numpy
+pandas
 Pillow
+joblib
+tensorflow
 torch
 torchvision
-pandas
-joblib==1.6.0
-scikit-learn==1.6.1
-tensorflow
+scikit-learn
