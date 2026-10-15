@@ -1002,11 +1002,6 @@ if image is not None:
         st.write("**Format:** RGB")
         st.write(f"**Image mode:** {image.mode}")
 
-else:
-    st.info(
-        "Upload a JPG, JPEG, PNG, BMP, TIFF or WEBP image "
-        "to display the retinal image here."
-    )
 
 # --------------------------- REST OF YOUR DASHBOARD ---------------------------
 # Keep your existing retinal analysis, clinical prediction,
