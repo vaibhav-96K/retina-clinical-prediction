@@ -944,17 +944,22 @@ if image_key != st.session_state.selected_image_key:
 if image is not None:
     st.divider()
     st.subheader("📷 Selected Retinal Image")
+
     preview_col, details_col = st.columns([1, 1])
-   
+
     with preview_col:
-        display_buffer = io.BytesIO()
-        image.convert("RGB").save(display_buffer, format="PNG")
         st.image(
-            display_buffer.getvalue(),
+            image.convert("RGB"),
             caption="Uploaded Retinal / Fundus Image",
-            output_format="PNG",
             use_container_width=True,
         )
+
+    with details_col:
+        st.markdown("### Image Information")
+        st.write(f"**Width:** {image.width} px")
+        st.write(f"**Height:** {image.height} px")
+        st.write("**Format:** RGB")
+        st.write(f"**Device:** {DEVICE}")
 
     with details_col:
         st.markdown("### Image Information")
