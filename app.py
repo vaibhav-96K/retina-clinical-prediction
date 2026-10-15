@@ -946,11 +946,12 @@ if image is not None:
     st.subheader("📷 Selected Retinal Image")
     preview_col, details_col = st.columns([1, 1])
 
+    
     with preview_col:
-        # Direct PIL display: no HTML img tags or local paths.
         st.image(
-            image,
+            np.asarray(image.convert("RGB"), dtype=np.uint8),
             caption="Uploaded Retinal / Fundus Image",
+            output_format="PNG",
             use_container_width=True,
         )
     with details_col:
