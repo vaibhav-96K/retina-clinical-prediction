@@ -945,7 +945,6 @@ if image is not None:
     st.divider()
     st.subheader("📷 Selected Retinal Image")
     preview_col, details_col = st.columns([1, 1])
-
     
     with preview_col:
         st.image(
