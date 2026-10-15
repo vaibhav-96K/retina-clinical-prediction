@@ -1062,8 +1062,6 @@ else:
         "Upload or capture a retinal image to run retinal analysis and the image-plus-clinical fusion model. "
         "The clinical-only Heart Disease Model below works without an image."
     )
-    st.subheader("❤️ Heart Disease Prediction — Fusion Model")
-    st.info("Upload a retinal image to run the image-plus-clinical fusion model.")
 
 # Clinical-only model is available whether or not a retinal image was uploaded.
 clinical_only_prediction_section()
