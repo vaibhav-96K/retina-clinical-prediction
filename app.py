@@ -852,14 +852,21 @@ def show_gradcam(image):
             heat[..., 2] = 1 - cam
             overlay = np.clip(0.55 * base + 0.45 * heat, 0, 1)
             overlay_image = Image.fromarray((overlay * 255).astype(np.uint8))
+       
             c1, c2 = st.columns(2)
+
             with c1:
-                st.image(image, caption="Original retinal image", use_container_width=True)
+                st.image(
+                    image.convert("RGB"),
+                    caption="Original retinal image",
+                    width=450,
+                )
+
             with c2:
                 st.image(
-                    overlay_image,
+                    overlay_image.convert("RGB"),
                     caption=f"Grad-CAM — class index {class_index}",
-                    use_container_width=True,
+                    width=450,
                 )
         except Exception as error:
             st.error(f"Grad-CAM failed: {type(error).__name__}: {error}")
