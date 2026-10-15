@@ -576,10 +576,12 @@ def clinical_only_prediction_section():
     st.divider()
     st.header("❤️ Heart Disease Prediction — Clinical Model")
     st.caption(
-        "This optional model uses clinical data only; it does not use the retinal image."
+        "Clinical values are pre-filled automatically for a demo prediction. "
+        "Uploading a retinal image is optional for this clinical-only model; the image itself does not provide these clinical measurements. "
+        "Edit the values if needed, then press Predict to update the result."
     )
     if not CAD_MODEL_PATH.is_file():
-        st.info("Clinical-only model not found in the models folder.")
+        st.info(f"Clinical-only model not found: `{CAD_MODEL_PATH}`. Add the trained model to the models folder.")
         return
 
     try:
@@ -587,47 +589,93 @@ def clinical_only_prediction_section():
             str(CAD_MODEL_PATH), CAD_MODEL_PATH.stat().st_mtime
         )
         model = artifact["model"]
-        features = artifact.get("feature_columns", [])
+        features = artifact.get("feature_columns", []) or [
+            "age", "sex", "cp", "trestbps", "chol", "fbs", "restecg",
+            "thalach", "exang", "oldpeak", "slope", "ca", "thal",
+        ]
     except Exception as error:
-        st.error(f"Could not load clinical model: {error}")
+        st.error(f"Could not load clinical model: {type(error).__name__}: {error}")
         return
+
+    # Show saved evaluation metrics as soon as the artifact loads (not only after submit).
+    # Support common key names and nested evaluation dictionaries used by training scripts.
+    metrics = artifact.get("metrics", {}) if isinstance(artifact.get("metrics", {}), dict) else {}
+    accuracy = next((artifact.get(k) for k in (
+        "test_accuracy", "saved_test_accuracy", "accuracy", "test_acc"
+    ) if artifact.get(k) is not None), None)
+    if accuracy is None:
+        accuracy = next((metrics.get(k) for k in ("test_accuracy", "accuracy", "test_acc") if metrics.get(k) is not None), None)
+
+    auc = next((artifact.get(k) for k in (
+        "test_roc_auc", "saved_test_roc_auc", "roc_auc", "test_auc", "auc"
+    ) if artifact.get(k) is not None), None)
+    if auc is None:
+        auc = next((metrics.get(k) for k in ("test_roc_auc", "roc_auc", "test_auc", "auc") if metrics.get(k) is not None), None)
+
+    balanced_accuracy = next((artifact.get(k) for k in (
+        "balanced_accuracy", "test_balanced_accuracy", "saved_balanced_accuracy"
+    ) if artifact.get(k) is not None), None)
+    if balanced_accuracy is None:
+        balanced_accuracy = next((metrics.get(k) for k in ("balanced_accuracy", "test_balanced_accuracy") if metrics.get(k) is not None), None)
+
+    metric_cols = st.columns(3)
+    with metric_cols[0]:
+        st.metric(
+            "Saved test accuracy",
+            f"{float(accuracy) * 100:.2f}%" if accuracy is not None else "Not available",
+        )
+    with metric_cols[1]:
+        st.metric(
+            "Balanced accuracy",
+            f"{float(balanced_accuracy) * 100:.2f}%" if balanced_accuracy is not None else "Not available",
+        )
+    with metric_cols[2]:
+        st.metric(
+            "Saved test ROC-AUC",
+            f"{float(auc):.4f}" if auc is not None else "Not available",
+        )
 
     with st.form("cad_prediction_form"):
         st.subheader("Patient Clinical Information")
         c1, c2, c3 = st.columns(3)
         with c1:
-            age = st.number_input("Age (years)", 1, 120, 45)
+            age = st.number_input("Age (years)", 1, 120, 45, key="cad_age")
             sex = st.selectbox(
-                "Sex", [0, 1],
+                "Sex", [0, 1], index=0,
                 format_func=lambda x: "Female" if x == 0 else "Male",
+                key="cad_sex",
             )
-            cp = st.selectbox("Chest pain type (cp)", [1, 2, 3, 4])
-            trestbps = st.number_input("Resting blood pressure", 50, 250, 120)
-            chol = st.number_input("Cholesterol", 50, 700, 200)
+            cp = st.selectbox("Chest pain type (cp)", [1, 2, 3, 4], index=0, key="cad_cp")
+            trestbps = st.number_input("Resting blood pressure", 50, 250, 120, key="cad_trestbps")
+            chol = st.number_input("Cholesterol", 50, 700, 200, key="cad_chol")
         with c2:
             fbs = st.selectbox(
-                "Fasting blood sugar > 120", [0, 1],
+                "Fasting blood sugar > 120", [0, 1], index=0,
                 format_func=lambda x: "No" if x == 0 else "Yes",
+                key="cad_fbs",
             )
-            restecg = st.selectbox("Resting ECG", [0, 1, 2])
-            thalach = st.number_input("Maximum heart rate", 40, 250, 150)
+            restecg = st.selectbox("Resting ECG", [0, 1, 2], index=0, key="cad_restecg")
+            thalach = st.number_input("Maximum heart rate", 40, 250, 150, key="cad_thalach")
             exang = st.selectbox(
-                "Exercise-induced angina", [0, 1],
+                "Exercise-induced angina", [0, 1], index=0,
                 format_func=lambda x: "No" if x == 0 else "Yes",
+                key="cad_exang",
             )
         with c3:
-            oldpeak = st.number_input("ST depression (oldpeak)", 0.0, 10.0, 1.0, 0.1)
-            slope = st.selectbox("Slope", [1, 2, 3])
-            ca = st.selectbox("Major vessels (ca)", [0, 1, 2, 3])
-            thal = st.selectbox("Thal", [3, 6, 7])
+            oldpeak = st.number_input("ST depression (oldpeak)", 0.0, 10.0, 1.0, 0.1, key="cad_oldpeak")
+            slope = st.selectbox("Slope", [1, 2, 3], index=0, key="cad_slope")
+            ca = st.selectbox("Major vessels (ca)", [0, 1, 2, 3], index=0, key="cad_ca")
+            thal = st.selectbox("Thal", [3, 6, 7], index=0, key="cad_thal")
 
         submitted = st.form_submit_button(
-            "Run Clinical Heart Disease Prediction",
+            "❤️ Predict Heart Disease Risk",
             type="primary",
             use_container_width=True,
         )
 
-    if submitted:
+    # First visit automatically predicts using the pre-filled default clinical values.
+    # Later predictions update when the user submits edited clinical information.
+    if submitted or st.session_state.cad_result is None:
         patient = {
             "age": age, "sex": sex, "cp": cp, "trestbps": trestbps,
             "chol": chol, "fbs": fbs, "restecg": restecg,
@@ -653,34 +701,25 @@ def clinical_only_prediction_section():
             st.session_state.cad_result = {
                 "prediction": prediction,
                 "probability": probability,
+                "patient": patient,
             }
         except Exception as error:
             st.error(f"Clinical prediction failed: {type(error).__name__}: {error}")
 
     result = st.session_state.cad_result
     if result is not None:
+        st.subheader("📊 Clinical Model Prediction")
         if result["prediction"] == 1:
             st.warning("Model output: Disease present")
         else:
             st.success("Model output: No disease detected by the model")
-        if result["probability"] is not None:
+        if result.get("probability") is not None:
             st.metric(
                 "Positive-class probability",
                 f"{result['probability']:.2%}",
             )
-        accuracy = artifact.get("test_accuracy")
-        auc = artifact.get("test_roc_auc")
-        a, b = st.columns(2)
-        with a:
-            st.metric(
-                "Saved test accuracy",
-                f"{float(accuracy) * 100:.2f}%" if accuracy is not None else "Not available",
-            )
-        with b:
-            st.metric(
-                "Saved test ROC-AUC",
-                f"{float(auc):.4f}" if auc is not None else "Not available",
-            )
+        with st.expander("View submitted patient clinical data", expanded=True):
+            st.dataframe(pd.DataFrame([result.get("patient", {})]), use_container_width=True, hide_index=True)
         st.caption(f"Dataset: {artifact.get('dataset', 'Not specified')}")
         st.warning("Research prototype only; not a diagnosis or validated personal risk estimate.")
 
@@ -911,19 +950,18 @@ if image is not None:
     # Fusion model section remains separate from retinal predictions.
     fusion_prediction_section(image, image_key)
 
-    # Optional saved clinical-only model is clearly identified as separate.
-    with st.expander("Optional: Clinical-only Heart Disease Model", expanded=False):
-        clinical_only_prediction_section()
-
     show_gradcam(image)
 
 else:
     st.info(
-        "Upload or capture a retinal image. The preview and prediction options "
-        "will appear after an image is selected."
+        "Upload or capture a retinal image to run retinal analysis and the image-plus-clinical fusion model. "
+        "The clinical-only Heart Disease Model below works without an image."
     )
     st.subheader("❤️ Heart Disease Prediction — Fusion Model")
     st.info("Upload a retinal image to run the image-plus-clinical fusion model.")
+
+# Clinical-only model is available whether or not a retinal image was uploaded.
+clinical_only_prediction_section()
 
 st.divider()
 st.caption(
