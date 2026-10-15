@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 import joblib
 from PIL import Image
-import tensorflow as tf
 
 import torch
 import torch.nn as nn
@@ -69,9 +68,8 @@ CAD_MODEL_PATH = MODEL_DIR / "cad_heart_disease_model.joblib"
 CAP_MODEL_PATH = MODEL_DIR / "cap_grade_model.pth"
 
 # Keras retinal + clinical feature-fusion model and its scaler.
-FUSION_MODEL_PATH = (
-    MODEL_DIR / "retinal_feature_fusion_model_FINAL.keras"
-)
+# PyTorch retinal + clinical fusion model
+FUSION_MODEL_PATH = MODEL_DIR / "retinal_feature_fusion_model.pth"
 CLINICAL_SCALER_PATH = MODEL_DIR / "clinical_scaler.pkl"
 
 TRANSFORM = transforms.Compose([
@@ -272,262 +270,70 @@ def display_model_result(name, result):
 
 
 # =====================================================
-# KERAS RETINAL + CLINICAL RISK FUSION MODEL
+# RETINAL + CLINICAL FUSION RISK MODEL
 # =====================================================
 
-@st.cache_resource(show_spinner=False)
-def load_fusion_artifacts(
-    model_path,
-    model_mtime,
-    scaler_path,
-    scaler_mtime
-):
-    """Load the trained Keras fusion model and matching scaler."""
-
-    if not os.path.isfile(model_path):
-        raise FileNotFoundError(
-            f"Fusion model file missing: {model_path}"
-        )
-
-    if not os.path.isfile(scaler_path):
-        raise FileNotFoundError(
-            f"Clinical scaler file missing: {scaler_path}"
-        )
-
-    fusion_model = tf.keras.models.load_model(
-        model_path,
-        compile=False
-    )
-
-    # Only load pickle files from a trusted source.
-    clinical_scaler = joblib.load(scaler_path)
-
-    expected_features = list(
-        getattr(
-            clinical_scaler,
-            "feature_names_in_",
-            ["gender", "thickness", "age"]
-        )
-    )
-
-    if expected_features != ["gender", "thickness", "age"]:
-        raise ValueError(
-            "Scaler feature order mismatch. Expected "
-            "['gender', 'thickness', 'age'], found "
-            f"{expected_features}. Use the scaler from training."
-        )
-
-    if getattr(clinical_scaler, "n_features_in_", 3) != 3:
-        raise ValueError(
-            "Clinical scaler must accept exactly 3 features."
-        )
-
-    if len(fusion_model.inputs) != 2:
-        raise ValueError(
-            "Expected two model inputs: image and clinical data."
-        )
-
-    return fusion_model, clinical_scaler
-
-
-def predict_fusion_risk(
-    model,
-    scaler,
-    image,
-    gender_code,
-    thickness,
-    age
-):
-    """Run fusion prediction with the training feature order."""
-
-    # The Keras model has internal Rescaling/Normalization layers.
-    # Resize to 224x224, but do not apply PyTorch normalization here.
-    resized = image.convert("RGB").resize((224, 224))
-
-    image_array = np.asarray(
-        resized,
-        dtype=np.float32
-    )
-
-    image_batch = np.expand_dims(image_array, axis=0)
-
-    clinical_frame = pd.DataFrame(
-        [[
-            float(gender_code),
-            float(thickness),
-            float(age)
-        ]],
-        columns=["gender", "thickness", "age"],
-    )
-
-    clinical_scaled = scaler.transform(
-        clinical_frame
-    ).astype(np.float32)
-
-    outputs = model.predict(
-        [image_batch, clinical_scaled],
-        verbose=0
-    )
-
-    if isinstance(outputs, (list, tuple)):
-        if len(outputs) != 1:
-            raise ValueError(
-                "Fusion model returned multiple outputs unexpectedly."
-            )
-        outputs = outputs[0]
-
-    values = np.asarray(
-        outputs,
-        dtype=np.float32
-    ).reshape(-1)
-
-    if values.size != 1 or not np.all(np.isfinite(values)):
-        raise ValueError(
-            "Expected one finite binary-classification output; "
-            f"received {values}."
-        )
-
-    raw_score = float(values[0])
-
-    # The model's output is expected to be a sigmoid score.
-    # If it is outside [0,1], treat it as a logit.
-    if 0.0 <= raw_score <= 1.0:
-        score = raw_score
-    else:
-        score = float(
-            1.0 / (
-                1.0 + np.exp(
-                    -np.clip(raw_score, -50, 50)
-                )
-            )
-        )
-
-    return float(np.clip(score, 0.0, 1.0))
-
-
 def display_risk_prediction(image):
-    st.subheader("📊 Risk Prediction")
-
-    if not FUSION_MODEL_PATH.exists():
-        st.info(
-            "Fusion model missing. Add "
-            "models/retinal_feature_fusion_model_FINAL.keras."
-        )
-        return
-
-    if not CLINICAL_SCALER_PATH.exists():
-        st.info(
-            "Clinical scaler missing. Add "
-            "models/clinical_scaler.pkl."
-        )
-        return
-
+    st.subheader("📊 Fusion Risk Model")
     st.caption(
-        "Enter clinical features using the same gender encoding "
-        "and thickness units used during model training."
+        "This model is intended to combine a retinal image and clinical "
+        "features. It is listed separately because it uses both data types."
     )
 
-    with st.form("fusion_risk_form"):
-        gender_code = st.selectbox(
-            "Gender code used during training",
-            options=[0, 1],
-            format_func=lambda value: f"Code {value}",
-            help=(
-                "Choose the same 0/1 encoding used in the training dataset."
-            ),
-        )
-
-        thickness = st.number_input(
-            "Thickness (same units as training data)",
-            min_value=0.0,
-            max_value=100.0,
-            value=0.0,
-            step=0.1,
-            help=(
-                "Enter thickness in the same units and range used "
-                "when the model was trained."
-            ),
-        )
-
-        age = st.number_input(
-            "Age (years)",
-            min_value=1,
-            max_value=120,
-            value=50,
-            step=1,
-        )
-
-        submitted = st.form_submit_button(
-            "❤️ Run Heart Disease Risk Classification",
-            type="primary",
-            use_container_width=True,
-        )
-
-    if not submitted:
+    if not FUSION_MODEL_PATH.is_file():
         st.info(
-            "Select a retinal image, enter clinical features, "
-            "and click the prediction button."
+            "Fusion model not found. Expected file: "
+            "models/retinal_feature_fusion_model.pth"
         )
         return
 
-    if image is None:
+    st.success("Fusion Risk Model: Found")
+    st.write(f"Model file: `{FUSION_MODEL_PATH.relative_to(PROJECT_DIR)}`")
+
+    if not CLINICAL_SCALER_PATH.is_file():
         st.warning(
-            "Upload or capture a retinal/fundus image before "
-            "running risk prediction."
-        )
-        return
-
-    try:
-        with st.spinner(
-            "Running retinal + clinical fusion model..."
-        ):
-            model, scaler = load_fusion_artifacts(
-                str(FUSION_MODEL_PATH),
-                FUSION_MODEL_PATH.stat().st_mtime,
-                str(CLINICAL_SCALER_PATH),
-                CLINICAL_SCALER_PATH.stat().st_mtime,
-            )
-
-            risk_score = predict_fusion_risk(
-                model=model,
-                scaler=scaler,
-                image=image,
-                gender_code=gender_code,
-                thickness=thickness,
-                age=age,
-            )
-
-        risk_level = (
-            "High" if risk_score >= 0.5 else "Low"
+            "Clinical Scaler: Not found (`models/clinical_scaler.pkl`). "
+            "If the fusion model was trained with scaled clinical features, "
+            "the matching scaler file is also required."
         )
 
-        result_col1, result_col2 = st.columns(2)
+    st.info(
+        "The .pth file is detected, but prediction is not enabled yet because "
+        "the exact PyTorch fusion architecture and its input format must match "
+        "the architecture used during training. Loading a state_dict with a "
+        "different architecture can produce incorrect results or errors. "
+        "Once the training model class / save code is added, this section can "
+        "run the retinal-image + clinical-feature prediction."
+    )
 
-        with result_col1:
-            st.metric(
-                "Predicted Risk Class",
-                risk_level
+    with st.expander("Fusion model diagnostic"):
+        try:
+            checkpoint = torch.load(
+                FUSION_MODEL_PATH,
+                map_location="cpu",
+                weights_only=False
             )
-
-        with result_col2:
-            st.metric(
-                "Model Score",
-                f"{risk_score:.1%}"
+            if isinstance(checkpoint, nn.Module):
+                st.success(
+                    "Checkpoint contains a complete PyTorch model object. "
+                    "Its input signature still needs to be verified."
+                )
+            elif isinstance(checkpoint, dict):
+                st.write("Checkpoint keys:", list(checkpoint.keys())[:30])
+                architecture = checkpoint.get("architecture")
+                if architecture:
+                    st.write("Architecture metadata:", architecture)
+                st.caption(
+                    "Checkpoint is a dictionary/state_dict. Its exact model "
+                    "class must be recreated from the training code."
+                )
+            else:
+                st.write("Checkpoint type:", type(checkpoint).__name__)
+        except Exception as error:
+            st.error(
+                f"Could not inspect fusion checkpoint: "
+                f"{type(error).__name__}: {error}"
             )
-
-        st.progress(risk_score)
-
-        st.caption(
-            "Research output from the trained model, not a confirmed "
-            "diagnosis. The score is not a calibrated clinical probability "
-            "unless calibration was validated."
-        )
-
-    except Exception as error:
-        st.error(
-            f"Fusion risk prediction failed: "
-            f"{type(error).__name__}: {error}"
-        )
 
 
 # =====================================================
@@ -728,12 +534,12 @@ if CAD_MODEL_PATH.exists():
 else:
     st.sidebar.info("CAD model: Not found")
 
-if FUSION_MODEL_PATH.exists():
+if FUSION_MODEL_PATH.is_file():
     st.sidebar.success("Fusion Risk Model: Found")
 else:
     st.sidebar.info("Fusion Risk Model: Not found")
 
-if CLINICAL_SCALER_PATH.exists():
+if CLINICAL_SCALER_PATH.is_file():
     st.sidebar.success("Clinical Scaler: Found")
 else:
     st.sidebar.info("Clinical Scaler: Not found")
