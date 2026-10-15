@@ -902,14 +902,21 @@ for name, path in [
 
 # --------------------------- MAIN DASHBOARD ---------------------------
 
+
 st.title("👁️ Retina AI Research Dashboard")
 st.caption(
     "Upload a retinal image once, then run retinal analysis and heart-disease "
     "prediction separately."
 )
-st.warning("Research prototype only. Not validated for clinical diagnosis.")
+st.warning(
+    "Research prototype only. Not validated for clinical diagnosis."
+)
 
+# --------------------------------------------------
+# IMAGE UPLOAD AND CAMERA CAPTURE
+# --------------------------------------------------
 upload_col, camera_col = st.columns(2)
+
 with upload_col:
     st.subheader("🖼️ Upload Retinal Image")
     uploaded_file = st.file_uploader(
@@ -917,23 +924,61 @@ with upload_col:
         type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
         key="retina_upload",
     )
+
 with camera_col:
     st.subheader("📷 Capture Retinal Image")
-    camera_photo = st.camera_input("Capture fundus image", key="retina_camera")
+    camera_photo = st.camera_input(
+        "Capture fundus image",
+        key="retina_camera",
+    )
+
+# --------------------------------------------------
+# OPEN SELECTED IMAGE
+# --------------------------------------------------
 image = None
 image_key = None
 
-selected = uploaded_file if uploaded_file is not None else camera_photo
+selected = (
+    uploaded_file
+    if uploaded_file is not None
+    else camera_photo
+)
 
 if selected is not None:
     try:
-        image = Image.open(selected).convert("RGB")
-        image_key = hash_bytes(selected.getvalue())
+        raw_image_bytes = selected.getvalue()
+
+        image_key = hash_bytes(raw_image_bytes)
+
+        image = Image.open(
+            io.BytesIO(raw_image_bytes)
+        ).convert("RGB")
+
     except Exception as error:
         st.error(
             f"Could not open image: {type(error).__name__}: {error}"
         )
 
+# --------------------------------------------------
+# RESET OLD RESULTS WHEN IMAGE CHANGES
+# --------------------------------------------------
+if "selected_image_key" not in st.session_state:
+    st.session_state.selected_image_key = None
+
+if "retinal_results" not in st.session_state:
+    st.session_state.retinal_results = None
+
+if "retinal_result_key" not in st.session_state:
+    st.session_state.retinal_result_key = None
+
+if "fusion_result" not in st.session_state:
+    st.session_state.fusion_result = None
+
+if "fusion_result_key" not in st.session_state:
+    st.session_state.fusion_result_key = None
+
+if "cad_result" not in st.session_state:
+    st.session_state.cad_result = None
 
 if image_key != st.session_state.selected_image_key:
     st.session_state.selected_image_key = image_key
@@ -943,25 +988,23 @@ if image_key != st.session_state.selected_image_key:
     st.session_state.fusion_result_key = None
     st.session_state.cad_result = None
 
+# --------------------------------------------------
+# DISPLAY IMAGE PREVIEW AND INFORMATION
+# --------------------------------------------------
 if image is not None:
     st.divider()
     st.subheader("📷 Selected Retinal Image")
 
-  
     preview_col, details_col = st.columns([1, 1])
 
     with preview_col:
         st.markdown("### Uploaded Retinal Image")
 
-        try:
-            preview = image.convert("RGB").copy()
-            st.image(
-                preview,
-                caption="Uploaded Retinal / Fundus Image",
-                width=400,
-            )
-        except Exception as e:
-            st.error(f"Image preview error: {e}")
+        st.image(
+            image,
+            caption="Uploaded Retinal / Fundus Image",
+            width=400,
+        )
 
     with details_col:
         st.markdown("### Image Information")
@@ -969,6 +1012,17 @@ if image is not None:
         st.write(f"**Height:** {image.height} px")
         st.write("**Format:** RGB")
         st.write(f"**Device:** {DEVICE}")
+
+else:
+    st.info(
+        "Please upload a retinal image or capture one using the camera "
+        "to view the image preview."
+    )
+
+# --------------------------------------------------
+# CONTINUE WITH YOUR EXISTING DASHBOARD BELOW
+# --------------------------------------------------
+
 
     st.divider()
     st.header("Choose Prediction")
