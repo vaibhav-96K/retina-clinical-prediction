@@ -10,6 +10,7 @@ from PIL import Image
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
+import tensorflow as tf
 
 
 # =====================================================
@@ -69,7 +70,7 @@ CAP_MODEL_PATH = MODEL_DIR / "cap_grade_model.pth"
 
 # Keras retinal + clinical feature-fusion model and its scaler.
 # PyTorch retinal + clinical fusion model
-FUSION_MODEL_PATH = MODEL_DIR / "retinal_feature_fusion_model.pth"
+FUSION_MODEL_PATH = MODEL_DIR / "retinal_feature_fusion_model_FINAL.keras"
 CLINICAL_SCALER_PATH = MODEL_DIR / "clinical_scaler.pkl"
 
 TRANSFORM = transforms.Compose([
@@ -283,7 +284,7 @@ def display_risk_prediction(image):
     if not FUSION_MODEL_PATH.is_file():
         st.info(
             "Fusion model not found. Expected file: "
-            "models/retinal_feature_fusion_model.pth"
+            "models/retinal_feature_fusion_model_FINAL.keras"
         )
         return
 
@@ -297,41 +298,39 @@ def display_risk_prediction(image):
             "the matching scaler file is also required."
         )
 
+    st.success("Keras Fusion Risk Model: Found")
+    st.write(f"Model file: `{FUSION_MODEL_PATH.relative_to(PROJECT_DIR)}`")
+
+    if not CLINICAL_SCALER_PATH.is_file():
+        st.warning(
+            "Clinical Scaler not found (`models/clinical_scaler.pkl`). "
+            "If the model expects scaled clinical features, the matching "
+            "scaler is required for valid predictions."
+        )
+
     st.info(
-        "The .pth file is detected, but prediction is not enabled yet because "
-        "the exact PyTorch fusion architecture and its input format must match "
-        "the architecture used during training. Loading a state_dict with a "
-        "different architecture can produce incorrect results or errors. "
-        "Once the training model class / save code is added, this section can "
-        "run the retinal-image + clinical-feature prediction."
+        "The .keras model is detected. Prediction requires the exact input "
+        "shapes and preprocessing used during training (retinal image and "
+        "clinical features). The model is loaded below for diagnostics; "
+        "prediction is enabled only when its input contract is known."
     )
 
     with st.expander("Fusion model diagnostic"):
         try:
-            checkpoint = torch.load(
+            keras_model = tf.keras.models.load_model(
                 FUSION_MODEL_PATH,
-                map_location="cpu",
-                weights_only=False
+                compile=False
             )
-            if isinstance(checkpoint, nn.Module):
-                st.success(
-                    "Checkpoint contains a complete PyTorch model object. "
-                    "Its input signature still needs to be verified."
-                )
-            elif isinstance(checkpoint, dict):
-                st.write("Checkpoint keys:", list(checkpoint.keys())[:30])
-                architecture = checkpoint.get("architecture")
-                if architecture:
-                    st.write("Architecture metadata:", architecture)
-                st.caption(
-                    "Checkpoint is a dictionary/state_dict. Its exact model "
-                    "class must be recreated from the training code."
-                )
-            else:
-                st.write("Checkpoint type:", type(checkpoint).__name__)
+            st.success("Keras model loaded successfully.")
+            st.write("Input shape(s):", keras_model.input_shape)
+            st.write("Output shape(s):", keras_model.output_shape)
+            st.caption(
+                "Confirm the training-time input order, image preprocessing, "
+                "clinical feature order, and scaler before enabling prediction."
+            )
         except Exception as error:
             st.error(
-                f"Could not inspect fusion checkpoint: "
+                f"Could not load Keras fusion model: "
                 f"{type(error).__name__}: {error}"
             )
 
