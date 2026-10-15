@@ -1,4 +1,4 @@
-```python
+
 # app.py
 # Retina AI - Research Prediction Dashboard
 
