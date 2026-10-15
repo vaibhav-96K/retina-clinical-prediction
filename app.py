@@ -11,7 +11,7 @@ from PIL import Image
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
-import tensorflow as tf 
+import tensorflow as tf
 
 # =====================================================
 # SESSION STATE
