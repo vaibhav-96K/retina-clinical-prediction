@@ -900,27 +900,30 @@ for name, path in [
     else:
         st.sidebar.info(f"{name}: Missing")
 
+
 # --------------------------- MAIN DASHBOARD ---------------------------
 
+import io
+import hashlib
+from PIL import Image, ImageOps
 
 st.title("👁️ Retina AI Research Dashboard")
 st.caption(
-    "Upload a retinal image once, then run retinal analysis and heart-disease "
-    "prediction separately."
+    "Upload a retinal image once, then run retinal analysis and "
+    "heart-disease prediction separately."
 )
 st.warning(
     "Research prototype only. Not validated for clinical diagnosis."
 )
 
-# --------------------------------------------------
-# IMAGE UPLOAD AND CAMERA CAPTURE
-# --------------------------------------------------
+# --------------------------- IMAGE UPLOAD ---------------------------
+
 upload_col, camera_col = st.columns(2)
 
 with upload_col:
     st.subheader("🖼️ Upload Retinal Image")
     uploaded_file = st.file_uploader(
-        "Choose image",
+        "Choose retinal image",
         type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
         key="retina_upload",
     )
@@ -932,26 +935,20 @@ with camera_col:
         key="retina_camera",
     )
 
-# --------------------------------------------------
-# OPEN SELECTED IMAGE
-# --------------------------------------------------
+# --------------------------- LOAD IMAGE ---------------------------
+
 image = None
 image_key = None
 
-selected = (
-    uploaded_file
-    if uploaded_file is not None
-    else camera_photo
-)
+selected = uploaded_file if uploaded_file is not None else camera_photo
 
 if selected is not None:
     try:
         raw_image_bytes = selected.getvalue()
+        image_key = hashlib.sha256(raw_image_bytes).hexdigest()
 
-        image_key = hash_bytes(raw_image_bytes)
-
-        image = Image.open(
-            io.BytesIO(raw_image_bytes)
+        image = ImageOps.exif_transpose(
+            Image.open(io.BytesIO(raw_image_bytes))
         ).convert("RGB")
 
     except Exception as error:
@@ -959,26 +956,20 @@ if selected is not None:
             f"Could not open image: {type(error).__name__}: {error}"
         )
 
-# --------------------------------------------------
-# RESET OLD RESULTS WHEN IMAGE CHANGES
-# --------------------------------------------------
-if "selected_image_key" not in st.session_state:
-    st.session_state.selected_image_key = None
+# --------------------------- SESSION STATE ---------------------------
 
-if "retinal_results" not in st.session_state:
-    st.session_state.retinal_results = None
+default_states = {
+    "selected_image_key": None,
+    "retinal_results": None,
+    "retinal_result_key": None,
+    "fusion_result": None,
+    "fusion_result_key": None,
+    "cad_result": None,
+}
 
-if "retinal_result_key" not in st.session_state:
-    st.session_state.retinal_result_key = None
-
-if "fusion_result" not in st.session_state:
-    st.session_state.fusion_result = None
-
-if "fusion_result_key" not in st.session_state:
-    st.session_state.fusion_result_key = None
-
-if "cad_result" not in st.session_state:
-    st.session_state.cad_result = None
+for state_name, default_value in default_states.items():
+    if state_name not in st.session_state:
+        st.session_state[state_name] = default_value
 
 if image_key != st.session_state.selected_image_key:
     st.session_state.selected_image_key = image_key
@@ -988,9 +979,8 @@ if image_key != st.session_state.selected_image_key:
     st.session_state.fusion_result_key = None
     st.session_state.cad_result = None
 
-# --------------------------------------------------
-# DISPLAY IMAGE PREVIEW AND INFORMATION
-# --------------------------------------------------
+# --------------------------- IMAGE PREVIEW ---------------------------
+
 if image is not None:
     st.divider()
     st.subheader("📷 Selected Retinal Image")
@@ -999,23 +989,29 @@ if image is not None:
 
     with preview_col:
         st.markdown("### Uploaded Retinal Image")
-
         st.image(
             image,
             caption="Uploaded Retinal / Fundus Image",
-            width=400,
+            use_container_width=True,
         )
+
     with details_col:
         st.markdown("### Image Information")
         st.write(f"**Width:** {image.width} px")
         st.write(f"**Height:** {image.height} px")
         st.write("**Format:** RGB")
-        st.write(f"**Device:** {DEVICE}")
+        st.write(f"**Image mode:** {image.mode}")
+
 else:
     st.info(
-        "Please upload a retinal image or capture one using the camera "
-        "to view the image preview."
+        "Upload a JPG, JPEG, PNG, BMP, TIFF or WEBP image "
+        "to display the retinal image here."
     )
+
+# --------------------------- REST OF YOUR DASHBOARD ---------------------------
+# Keep your existing retinal analysis, clinical prediction,
+# fusion model, Grad-CAM and other dashboard code below this line.
+
 # --------------------------------------------------
 # CONTINUE WITH YOUR EXISTING DASHBOARD BELOW
 # --------------------------------------------------
