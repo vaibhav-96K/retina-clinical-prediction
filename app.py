@@ -1,4 +1,5 @@
 import os
+import io
 from pathlib import Path
 
 import streamlit as st
@@ -595,12 +596,13 @@ image_key = None
 try:
     if uploaded_file is not None:
         raw = uploaded_file.getvalue()
-        image = Image.open(uploaded_file).convert("RGB")
+        # Decode from bytes so the file pointer state cannot affect preview.
+        image = Image.open(io.BytesIO(raw)).convert("RGB").copy()
         image_key = str(hash(raw))
 
     elif camera_photo is not None:
         raw = camera_photo.getvalue()
-        image = Image.open(camera_photo).convert("RGB")
+        image = Image.open(io.BytesIO(raw)).convert("RGB").copy()
         image_key = str(hash(raw))
 
 except Exception as error:
@@ -628,9 +630,12 @@ if image is not None:
     with image_col:
         st.subheader("Selected Retinal Image")
 
+        # Render a plain RGB array as PNG to avoid media-preview/link issues.
         st.image(
-            image,
+            np.asarray(image.convert("RGB")),
             caption="Retinal / Fundus Image",
+            channels="RGB",
+            output_format="PNG",
             use_container_width=True,
         )
 
@@ -713,8 +718,10 @@ if external_eye_photo is not None:
         ).convert("RGB")
 
         st.image(
-            external_image,
+            np.asarray(external_image.convert("RGB")),
             caption="Captured External Eye Photo",
+            channels="RGB",
+            output_format="PNG",
             use_container_width=True,
         )
 
