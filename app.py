@@ -945,14 +945,17 @@ if image is not None:
     st.divider()
     st.subheader("📷 Selected Retinal Image")
     preview_col, details_col = st.columns([1, 1])
-    
+   
     with preview_col:
+        display_buffer = io.BytesIO()
+        image.convert("RGB").save(display_buffer, format="PNG")
         st.image(
-            np.asarray(image.convert("RGB"), dtype=np.uint8),
+            display_buffer.getvalue(),
             caption="Uploaded Retinal / Fundus Image",
             output_format="PNG",
             use_container_width=True,
         )
+
     with details_col:
         st.markdown("### Image Information")
         st.write(f"**Width:** {image.width} px")
