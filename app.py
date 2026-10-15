@@ -276,62 +276,48 @@ def display_model_result(name, result):
 # =====================================================
 
 def display_risk_prediction(image):
-    st.subheader("📊 Fusion Risk Model")
+    """Show one concise fusion-risk model status and its diagnostics."""
+    st.subheader("📊 Fusion Risk Prediction")
     st.caption(
-        "This model is intended to combine a retinal image and clinical "
-        "features. It is listed separately because it uses both data types."
+        "Uses the retinal image and clinical features together. "
+        "Research prototype only; not a medical diagnosis."
     )
 
     if not FUSION_MODEL_PATH.is_file():
-        st.info(
-            "Fusion model not found. Expected file: "
+        st.warning(
+            "Fusion risk model not found. Expected file: "
             "models/retinal_feature_fusion_model_FINAL.keras"
         )
         return
 
-    st.success("Fusion Risk Model: Found")
-    st.write(f"Model file: `{FUSION_MODEL_PATH.relative_to(PROJECT_DIR)}`")
+    st.success("Fusion risk model found and ready for inspection.")
+    st.caption(f"Model file: `{FUSION_MODEL_PATH.relative_to(PROJECT_DIR)}`")
 
     if not CLINICAL_SCALER_PATH.is_file():
         st.warning(
-            "Clinical Scaler: Not found (`models/clinical_scaler.pkl`). "
-            "If the fusion model was trained with scaled clinical features, "
-            "the matching scaler file is also required."
+            "Clinical scaler not found (`models/clinical_scaler.pkl`). "
+            "If the model was trained with scaled clinical features, its "
+            "matching scaler is required for valid predictions."
         )
 
-    st.success("Keras Fusion Risk Model: Found")
-    st.write(f"Model file: `{FUSION_MODEL_PATH.relative_to(PROJECT_DIR)}`")
-
-    if not CLINICAL_SCALER_PATH.is_file():
-        st.warning(
-            "Clinical Scaler not found (`models/clinical_scaler.pkl`). "
-            "If the model expects scaled clinical features, the matching "
-            "scaler is required for valid predictions."
-        )
-
-    st.info(
-        "The .keras model is detected. Prediction requires the exact input "
-        "shapes and preprocessing used during training (retinal image and "
-        "clinical features). The model is loaded below for diagnostics; "
-        "prediction is enabled only when its input contract is known."
-    )
-
-    with st.expander("Fusion model diagnostic"):
+    with st.expander("Fusion risk model diagnostics", expanded=False):
         try:
             keras_model = tf.keras.models.load_model(
                 FUSION_MODEL_PATH,
-                compile=False
+                compile=False,
             )
-            st.success("Keras model loaded successfully.")
+            st.write("Model status: Loaded successfully")
             st.write("Input shape(s):", keras_model.input_shape)
             st.write("Output shape(s):", keras_model.output_shape)
             st.caption(
-                "Confirm the training-time input order, image preprocessing, "
-                "clinical feature order, and scaler before enabling prediction."
+                "A risk prediction is not run here because the exact training-time "
+                "input order, clinical feature schema, image preprocessing, and "
+                "scaler must match the saved model. Showing a score without those "
+                "details could produce an invalid result."
             )
         except Exception as error:
             st.error(
-                f"Could not load Keras fusion model: "
+                f"Could not load fusion risk model: "
                 f"{type(error).__name__}: {error}"
             )
 
@@ -630,11 +616,16 @@ if image is not None:
     with image_col:
         st.subheader("Selected Retinal Image")
 
-        # Render a plain RGB array as PNG to avoid media-preview/link issues.
+        # Encode explicitly as PNG bytes. This avoids Streamlit/browser
+        # rendering issues with array-backed images while keeping the layout.
+        preview_buffer = io.BytesIO()
+        image.convert("RGB").save(preview_buffer, format="PNG")
+        preview_bytes = preview_buffer.getvalue()
+        if not preview_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("Could not create a valid PNG preview.")
         st.image(
-            np.asarray(image.convert("RGB")),
+            preview_bytes,
             caption="Retinal / Fundus Image",
-            channels="RGB",
             output_format="PNG",
             use_container_width=True,
         )
@@ -717,10 +708,12 @@ if external_eye_photo is not None:
             external_eye_photo
         ).convert("RGB")
 
+        external_buffer = io.BytesIO()
+        external_image.convert("RGB").save(external_buffer, format="PNG")
+        external_bytes = external_buffer.getvalue()
         st.image(
-            np.asarray(external_image.convert("RGB")),
+            external_bytes,
             caption="Captured External Eye Photo",
-            channels="RGB",
             output_format="PNG",
             use_container_width=True,
         )
