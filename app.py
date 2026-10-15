@@ -918,18 +918,20 @@ with upload_col:
 with camera_col:
     st.subheader("📷 Capture Retinal Image")
     camera_photo = st.camera_input("Capture fundus image", key="retina_camera")
-
 image = None
 image_key = None
 
-try:
-   selected = uploaded_file if uploaded_file is not None else camera_photo
+selected = uploaded_file if uploaded_file is not None else camera_photo
 
 if selected is not None:
-    image = Image.open(selected).convert("RGB")
-    image_key = hash_bytes(selected.getvalue())
-except Exception as error:
-    st.error(f"Could not open image: {type(error).__name__}: {error}")
+    try:
+        image = Image.open(selected).convert("RGB")
+        image_key = hash_bytes(selected.getvalue())
+    except Exception as error:
+        st.error(
+            f"Could not open image: {type(error).__name__}: {error}"
+        )
+
 
 if image_key != st.session_state.selected_image_key:
     st.session_state.selected_image_key = image_key
