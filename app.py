@@ -923,13 +923,11 @@ image = None
 image_key = None
 
 try:
-    selected = uploaded_file if uploaded_file is not None else camera_photo
-    if selected is not None:
-        raw = selected.getvalue()
-        image = ImageOps.exif_transpose(
-            Image.open(io.BytesIO(raw))
-        ).convert("RGB").copy()
-        image_key = hash_bytes(raw)
+   selected = uploaded_file if uploaded_file is not None else camera_photo
+
+if selected is not None:
+    image = Image.open(selected).convert("RGB")
+    image_key = hash_bytes(selected.getvalue())
 except Exception as error:
     st.error(f"Could not open image: {type(error).__name__}: {error}")
 
