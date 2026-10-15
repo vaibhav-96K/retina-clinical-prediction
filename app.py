@@ -1005,20 +1005,17 @@ if image is not None:
             caption="Uploaded Retinal / Fundus Image",
             width=400,
         )
-
     with details_col:
         st.markdown("### Image Information")
         st.write(f"**Width:** {image.width} px")
         st.write(f"**Height:** {image.height} px")
         st.write("**Format:** RGB")
         st.write(f"**Device:** {DEVICE}")
-
 else:
     st.info(
         "Please upload a retinal image or capture one using the camera "
         "to view the image preview."
     )
-
 # --------------------------------------------------
 # CONTINUE WITH YOUR EXISTING DASHBOARD BELOW
 # --------------------------------------------------
