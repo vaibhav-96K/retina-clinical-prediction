@@ -1,32 +1,66 @@
 
-# app.py
-# Retina AI - Research Prediction Dashboard
+# ============================================================
+# 👁️ RETINA AI — RESEARCH PREDICTION DASHBOARD
+# ============================================================
 
+import io
 import json
-import warnings
+import hashlib
 from pathlib import Path
 
-import joblib
+import streamlit as st
 import numpy as np
 import pandas as pd
-import streamlit as st
-from PIL import Image, ImageOps
+import joblib
+from PIL import Image
 
-warnings.filterwarnings("ignore")
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import models, transforms
+import tensorflow as tf
 
-# ---------------------------------------------------------
-# PAGE CONFIGURATION
-# ---------------------------------------------------------
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
 
 st.set_page_config(
-    page_title="Retina AI | Research Prediction Dashboard",
+    page_title="Retina AI Dashboard",
     page_icon="👁️",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
+
+st.markdown("""
+<style>
+.stApp {
+    background-color: #f5f8fc;
+}
+h1, h2, h3 {
+    color: #17365d;
+}
+div[data-testid="stMetric"] {
+    background: white;
+    border: 1px solid #dce5f0;
+    padding: 14px;
+    border-radius: 12px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ============================================================
+# PATHS AND SETTINGS
+# ============================================================
 
 PROJECT_DIR = Path(__file__).resolve().parent
 MODEL_DIR = PROJECT_DIR / "models"
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+IMAGE_SIZE = 224
 
 MODEL_FILES = {
     "Retinal Age": ("retina_age_model.pth", "regression"),
@@ -48,496 +82,86 @@ DISEASE_LABELS = [
 
 SEX_CLASS_LABELS = ["Female", "Male"]
 
+DISEASE_THRESHOLD = 0.50
+DIABETES_THRESHOLD = 0.50
+
+# IMPORTANT:
+# Set this only after confirming the trained CIMT model's output units
+# and the cutoff appropriate for your research dataset.
+# Example: 0.9 is meaningful only if the model output is in mm and
+# that threshold is justified for the intended research task.
+CIMT_POSITIVE_THRESHOLD = None
+
 CAD_MODEL_PATH = MODEL_DIR / "cad_heart_disease_model.joblib"
-FUSION_MODEL_PATH = MODEL_DIR / "retinal_feature_fusion_model_FINAL.keras"
+
+FUSION_MODEL_PATH = (
+    MODEL_DIR / "retinal_feature_fusion_model_FINAL.keras"
+)
 CLINICAL_SCALER_PATH = MODEL_DIR / "clinical_scaler.pkl"
 FUSION_METADATA_PATH = MODEL_DIR / "fusion_metadata.json"
 
+# This is a configurable research risk threshold, not a validated
+# clinical risk score. Set values according to your trained model.
+RISK_LOW_MAX = 0.33
+RISK_MEDIUM_MAX = 0.66
 
-# ---------------------------------------------------------
-# STYLING
-# ---------------------------------------------------------
-
-st.markdown(
-    """
-    <style>
-    .stApp {
-        background-color: #f4f7fb;
-    }
-
-    .main-title {
-        font-size: 2.15rem;
-        font-weight: 750;
-        color: #172554;
-        margin-bottom: 0.2rem;
-    }
-
-    .subtitle {
-        color: #64748b;
-        font-size: 1rem;
-        margin-bottom: 1.5rem;
-    }
-
-    .section-title {
-        color: #1e293b;
-        font-size: 1.4rem;
-        font-weight: 700;
-    }
-
-    div[data-testid="stMetric"] {
-        background: white;
-        border: 1px solid #e2e8f0;
-        padding: 15px;
-        border-radius: 12px;
-    }
-
-    div[data-testid="stForm"] {
-        background: white;
-        padding: 18px;
-        border-radius: 12px;
-        border: 1px solid #e2e8f0;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+TRANSFORM = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225],
+    ),
+])
 
 
-# ---------------------------------------------------------
+# ============================================================
 # SESSION STATE
-# ---------------------------------------------------------
+# ============================================================
 
-DEFAULT_STATE = {
+DEFAULTS = {
+    "selected_image_key": None,
     "retinal_results": None,
     "retinal_result_key": None,
-    "cad_prediction_result": None,
-    "last_image_key": None,
+    "fusion_result": None,
+    "fusion_result_key": None,
+    "gradcam_key": None,
 }
 
-for key, value in DEFAULT_STATE.items():
+for key, default in DEFAULTS.items():
     if key not in st.session_state:
-        st.session_state[key] = value
+        st.session_state[key] = default
 
 
-# ---------------------------------------------------------
-# HEADER
-# ---------------------------------------------------------
+# ============================================================
+# HELPERS
+# ============================================================
 
-st.markdown(
-    '<div class="main-title">👁️ Retina AI</div>',
-    unsafe_allow_html=True,
-)
-st.markdown(
-    '<div class="subtitle">Research Prediction Dashboard</div>',
-    unsafe_allow_html=True,
-)
+def hash_bytes(data):
+    return hashlib.sha256(data).hexdigest()
 
-st.caption(
-    "Research prototype for retinal image analysis and clinical "
-    "heart-disease classification."
-)
 
-st.divider()
+def finite_array(values):
+    values = np.asarray(values)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Model returned invalid numeric values.")
+    return values
 
 
-# ---------------------------------------------------------
-# DEVICE INFORMATION
-# ---------------------------------------------------------
+def sigmoid(values):
+    values = np.asarray(values, dtype=np.float64)
+    values = np.clip(values, -80, 80)
+    return 1.0 / (1.0 + np.exp(-values))
 
-try:
-    import torch
 
-    DEVICE = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
-except Exception:
-    torch = None
-    DEVICE = "cpu"
+def softmax(values):
+    values = np.asarray(values, dtype=np.float64)
+    values = values - np.max(values)
+    exps = np.exp(np.clip(values, -80, 80))
+    return exps / exps.sum()
 
 
-# ---------------------------------------------------------
-# LOAD CLINICAL HEART DISEASE MODEL
-# ---------------------------------------------------------
-
-@st.cache_resource
-def load_cad_artifact(model_path, modified_time):
-    artifact = joblib.load(model_path)
-
-    # Support the saved dictionary format and a plain estimator.
-    if isinstance(artifact, dict) and "model" in artifact:
-        return artifact
-
-    return {
-        "model": artifact,
-        "feature_columns": [
-            "age", "sex", "cp", "trestbps", "chol", "fbs",
-            "restecg", "thalach", "exang", "oldpeak",
-            "slope", "ca", "thal",
-        ],
-        "classes": ["No disease", "Disease present"],
-        "test_accuracy": None,
-        "test_roc_auc": None,
-        "dataset": "Unknown",
-        "warning": "Research prototype; not clinically validated.",
-    }
-
-
-# ---------------------------------------------------------
-# HEART DISEASE RISK SECTION
-# ---------------------------------------------------------
-
-def heart_disease_section():
-    st.header("❤️ Heart Disease Risk")
-    st.write(
-        "Enter the patient's clinical values to run the saved "
-        "clinical model. The retinal image is not used by this model."
-    )
-
-    if not CAD_MODEL_PATH.exists():
-        st.error(
-            "Clinical model file was not found.\n\n"
-            f"Expected path: `{CAD_MODEL_PATH}`\n\n"
-            "Place cad_heart_disease_model.joblib inside the models folder."
-        )
-        return
-
-    try:
-        artifact = load_cad_artifact(
-            str(CAD_MODEL_PATH),
-            CAD_MODEL_PATH.stat().st_mtime,
-        )
-        model = artifact["model"]
-        feature_columns = artifact.get(
-            "feature_columns",
-            [
-                "age", "sex", "cp", "trestbps", "chol", "fbs",
-                "restecg", "thalach", "exang", "oldpeak",
-                "slope", "ca", "thal",
-            ],
-        )
-    except Exception as error:
-        st.error(
-            f"Could not load the clinical model: "
-            f"{type(error).__name__}: {error}"
-        )
-        return
-
-    with st.form("cad_prediction_form"):
-        st.subheader("Patient Clinical Information")
-
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-            age = st.number_input(
-                "Age (years)", min_value=1, max_value=120, value=45
-            )
-            sex = st.selectbox(
-                "Sex", options=[0, 1],
-                format_func=lambda x: "Female" if x == 0 else "Male",
-            )
-            cp = st.selectbox(
-                "Chest pain type",
-                options=[1, 2, 3, 4],
-                format_func=lambda x: {
-                    1: "Type 1",
-                    2: "Type 2",
-                    3: "Type 3",
-                    4: "Type 4",
-                }[x],
-            )
-            trestbps = st.number_input(
-                "Resting blood pressure",
-                min_value=50, max_value=250, value=120,
-            )
-            chol = st.number_input(
-                "Cholesterol",
-                min_value=50, max_value=700, value=200,
-            )
-
-        with c2:
-            fbs = st.selectbox(
-                "Fasting blood sugar > 120 mg/dl",
-                options=[0, 1],
-                format_func=lambda x: "No" if x == 0 else "Yes",
-            )
-            restecg = st.selectbox(
-                "Resting ECG", options=[0, 1, 2]
-            )
-            thalach = st.number_input(
-                "Maximum heart rate achieved",
-                min_value=40, max_value=250, value=150,
-            )
-            exang = st.selectbox(
-                "Exercise-induced angina",
-                options=[0, 1],
-                format_func=lambda x: "No" if x == 0 else "Yes",
-            )
-
-        with c3:
-            oldpeak = st.number_input(
-                "ST depression (oldpeak)",
-                min_value=0.0, max_value=10.0,
-                value=1.0, step=0.1,
-            )
-            slope = st.selectbox(
-                "Slope of peak exercise ST segment",
-                options=[1, 2, 3],
-            )
-            ca = st.selectbox(
-                "Number of major vessels (ca)",
-                options=[0, 1, 2, 3],
-            )
-            thal = st.selectbox(
-                "Thal", options=[3, 6, 7],
-                format_func=lambda x: {
-                    3: "3",
-                    6: "6",
-                    7: "7",
-                }[x],
-            )
-
-        submitted = st.form_submit_button(
-            "❤️ Run Heart Disease Risk Prediction",
-            type="primary",
-            use_container_width=True,
-        )
-
-    if submitted:
-        patient = {
-            "age": age,
-            "sex": sex,
-            "cp": cp,
-            "trestbps": trestbps,
-            "chol": chol,
-            "fbs": fbs,
-            "restecg": restecg,
-            "thalach": thalach,
-            "exang": exang,
-            "oldpeak": oldpeak,
-            "slope": slope,
-            "ca": ca,
-            "thal": thal,
-        }
-
-        try:
-            patient_df = pd.DataFrame([patient])
-
-            # Keep the exact feature order used during training.
-            patient_df = patient_df.reindex(
-                columns=feature_columns
-            )
-
-            prediction = int(model.predict(patient_df)[0])
-
-            probability = None
-            if hasattr(model, "predict_proba"):
-                probabilities = model.predict_proba(patient_df)[0]
-                classes = list(getattr(model, "classes_", [0, 1]))
-
-                positive_indices = [
-                    i for i, cls in enumerate(classes)
-                    if str(cls) in ("1", "1.0", "True")
-                ]
-
-                if positive_indices:
-                    probability = float(
-                        probabilities[positive_indices[0]]
-                    )
-                elif len(probabilities) > 1:
-                    probability = float(probabilities[-1])
-
-            st.session_state["cad_prediction_result"] = {
-                "prediction": prediction,
-                "probability": probability,
-                "patient": patient,
-            }
-
-        except Exception as error:
-            st.error(
-                f"Prediction failed: {type(error).__name__}: {error}"
-            )
-
-    result = st.session_state.get("cad_prediction_result")
-
-    if result is not None:
-        st.divider()
-        st.subheader("Clinical Model Prediction")
-
-        prediction = result["prediction"]
-        probability = result["probability"]
-
-        if prediction == 1:
-            st.warning(
-                "Model output: Disease present"
-            )
-        else:
-            st.success(
-                "Model output: No disease detected by the model"
-            )
-
-        if probability is not None:
-            st.metric(
-                "Model-estimated positive-class probability",
-                f"{probability * 100:.2f}%",
-            )
-            st.progress(
-                max(0.0, min(1.0, probability))
-            )
-
-        metric1, metric2 = st.columns(2)
-
-        accuracy = artifact.get("test_accuracy")
-        auc = artifact.get("test_roc_auc")
-
-        with metric1:
-            if accuracy is not None:
-                st.metric(
-                    "Saved test accuracy",
-                    f"{float(accuracy) * 100:.2f}%",
-                )
-            else:
-                st.metric("Saved test accuracy", "Not available")
-
-        with metric2:
-            if auc is not None:
-                st.metric(
-                    "Saved test ROC-AUC",
-                    f"{float(auc):.4f}",
-                )
-            else:
-                st.metric("Saved test ROC-AUC", "Not available")
-
-        st.caption(
-            f"Training dataset: {artifact.get('dataset', 'Not specified')}"
-        )
-        st.warning(
-            "This is a research model trained on a public dataset. "
-            "Its output is not a clinically validated personal risk "
-            "estimate and must not be used for diagnosis or treatment."
-        )
-
-
-# ---------------------------------------------------------
-# IMAGE PREPROCESSING
-# ---------------------------------------------------------
-
-def prepare_image(uploaded_file):
-    """Open an uploaded image safely and return an RGB PIL image."""
-    image = Image.open(uploaded_file)
-    image = ImageOps.exif_transpose(image)
-    image = image.convert("RGB")
-    return image
-
-
-def get_image_key(uploaded_file):
-    """Create a stable identifier for the currently uploaded image."""
-    import hashlib
-
-    uploaded_file.seek(0)
-    data = uploaded_file.read()
-    uploaded_file.seek(0)
-
-    return hashlib.md5(data).hexdigest()
-
-
-# ---------------------------------------------------------
-# LOAD RETINAL MODELS
-# ---------------------------------------------------------
-
-@st.cache_resource
-def load_retinal_model(model_path, task, modified_time):
-    """
-    Load a complete PyTorch model or TorchScript model.
-
-    A state_dict-only checkpoint needs its original model architecture.
-    This function intentionally raises a clear error rather than
-    guessing the architecture and producing misleading predictions.
-    """
-    if torch is None:
-        raise RuntimeError("PyTorch is not installed.")
-
-    path = Path(model_path)
-
-    if not path.exists():
-        raise FileNotFoundError(f"Model file not found: {path}")
-
-    # First try TorchScript.
-    try:
-        model = torch.jit.load(
-            str(path), map_location=DEVICE
-        )
-        model.eval()
-        return model
-    except Exception:
-        pass
-
-    # Then try a saved complete nn.Module.
-    try:
-        checkpoint = torch.load(
-            str(path),
-            map_location=DEVICE,
-            weights_only=False,
-        )
-    except TypeError:
-        checkpoint = torch.load(
-            str(path), map_location=DEVICE
-        )
-
-    if isinstance(checkpoint, torch.nn.Module):
-        checkpoint.to(DEVICE)
-        checkpoint.eval()
-        return checkpoint
-
-    if isinstance(checkpoint, dict):
-        if isinstance(checkpoint.get("model"), torch.nn.Module):
-            model = checkpoint["model"]
-            model.to(DEVICE)
-            model.eval()
-            return model
-
-        raise RuntimeError(
-            "This .pth file appears to contain model weights only "
-            "(state_dict), not a complete model. The original model "
-            "architecture used during training is required to load it. "
-            "Use the model architecture from the training notebook."
-        )
-
-    raise RuntimeError(
-        f"Unsupported checkpoint format: {type(checkpoint).__name__}"
-    )
-
-
-# ---------------------------------------------------------
-# RETINAL MODEL PREDICTION
-# ---------------------------------------------------------
-
-def retinal_predict(model, image, task):
-    """
-    Run inference for a complete PyTorch model.
-
-    Assumes a 224x224 RGB input and ImageNet normalization.
-    Verify these preprocessing settings against the original training
-    notebook before relying on the predictions.
-    """
-    if torch is None:
-        raise RuntimeError("PyTorch is not installed.")
-
-    from torchvision import transforms
-
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        ),
-    ])
-
-    tensor = transform(image).unsqueeze(0).to(DEVICE)
-
-    with torch.no_grad():
-        output = model(tensor)
-
+def get_output(output):
     if isinstance(output, (tuple, list)):
         output = output[0]
 
@@ -547,326 +171,996 @@ def retinal_predict(model, image, task):
         elif "output" in output:
             output = output["output"]
         else:
-            output = next(iter(output.values()))
+            raise ValueError("Unknown model output dictionary.")
 
-    if not torch.is_tensor(output):
-        output = torch.as_tensor(output)
+    return output
 
-    output = output.detach().cpu().float().numpy()
-    output = np.asarray(output).squeeze()
+
+def clean_state_dict(state):
+    cleaned = {}
+
+    for key, value in state.items():
+        if not torch.is_tensor(value):
+            continue
+
+        while key.startswith(("module.", "model.", "net.")):
+            key = key.split(".", 1)[1]
+
+        cleaned[key] = value
+
+    return cleaned
+
+
+def extract_state_dict(checkpoint):
+    if isinstance(checkpoint, nn.Module):
+        return checkpoint.state_dict()
+
+    if isinstance(checkpoint, dict):
+        for key in (
+            "state_dict",
+            "model_state_dict",
+            "weights",
+            "model",
+            "net",
+        ):
+            candidate = checkpoint.get(key)
+
+            if isinstance(candidate, dict):
+                return candidate
+
+        if checkpoint and all(
+            torch.is_tensor(value)
+            for value in checkpoint.values()
+        ):
+            return checkpoint
+
+    raise ValueError("Unsupported checkpoint format.")
+
+
+# ============================================================
+# RETINAL MODEL LOADER
+# ============================================================
+
+@st.cache_resource(show_spinner=False)
+def load_retinal_model(path_string, task, modified_time):
+    path = Path(path_string)
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing model: {path.name}")
+
+    checkpoint = torch.load(
+        path,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    if isinstance(checkpoint, nn.Module):
+        model = checkpoint
+
+    else:
+        state = clean_state_dict(extract_state_dict(checkpoint))
+
+        # Assumes the original checkpoint used EfficientNet-B0.
+        if task == "multilabel":
+            output_size = len(DISEASE_LABELS)
+
+        elif task == "classification":
+            weight = state.get("classifier.1.weight")
+
+            if weight is None:
+                raise ValueError(
+                    "Cannot infer classifier size. "
+                    "Original model architecture is required."
+                )
+
+            output_size = int(weight.shape[0])
+
+        else:
+            output_size = 1
+
+        model = models.efficientnet_b0(weights=None)
+
+        model.classifier[1] = nn.Linear(
+            model.classifier[1].in_features,
+            output_size,
+        )
+
+        model.load_state_dict(state, strict=True)
+
+    model = model.to(DEVICE).eval()
+    return model
+
+
+# ============================================================
+# RETINAL INFERENCE
+# ============================================================
+
+def retinal_predict(model, image, task):
+    tensor = TRANSFORM(
+        image.convert("RGB")
+    ).unsqueeze(0).to(DEVICE)
+
+    with torch.inference_mode():
+        output = get_output(model(tensor))
+
+    values = output.detach().float().cpu().numpy().reshape(-1)
+    values = finite_array(values)
 
     if task == "regression":
-        return {
-            "task": task,
-            "value": float(np.asarray(output).reshape(-1)[0]),
-        }
-
-    if task == "classification":
-        values = np.asarray(output).reshape(-1)
-
-        if len(values) == 1:
-            probability = float(1 / (1 + np.exp(-values[0])))
-            index = int(probability >= 0.5)
-        else:
-            # If the output is already probabilities, preserve them;
-            # otherwise apply softmax.
-            if (
-                np.all(values >= 0)
-                and np.all(values <= 1)
-                and np.isclose(values.sum(), 1.0, atol=0.02)
-            ):
-                probabilities = values
-            else:
-                shifted = values - np.max(values)
-                exp_values = np.exp(shifted)
-                probabilities = exp_values / exp_values.sum()
-
-            index = int(np.argmax(probabilities))
-            probability = float(probabilities[index])
-
-        if len(values) == 2:
-            label = SEX_CLASS_LABELS[index]
-        else:
-            label = f"Class {index}"
-
-        return {
-            "task": task,
-            "class_index": index,
-            "label": label,
-            "confidence": probability,
-        }
+        return float(values[0])
 
     if task == "multilabel":
-        values = np.asarray(output).reshape(-1)
+        # This assumes model outputs are probabilities if all are in [0,1].
+        # If the model was trained with sigmoid logits, use sigmoid instead.
+        if np.all((values >= 0) & (values <= 1)):
+            return values
 
-        # Apply sigmoid if outputs do not look like probabilities.
-        if not (
-            np.all(values >= 0)
-            and np.all(values <= 1)
-        ):
-            values = 1 / (1 + np.exp(-values))
+        return sigmoid(values)
 
-        labels = []
-        for i, score in enumerate(values):
-            if score >= 0.5:
-                label = (
-                    DISEASE_LABELS[i]
-                    if i < len(DISEASE_LABELS)
-                    else f"Label {i}"
-                )
-                labels.append({
-                    "label": label,
-                    "score": float(score),
-                })
+    if len(values) == 1:
+        p = float(sigmoid(values)[0])
+        return {"Class 0": 1 - p, "Class 1": p}
 
-        return {
-            "task": task,
-            "scores": values.tolist(),
-            "labels": labels,
-        }
+    probabilities = softmax(values)
 
-    raise ValueError(f"Unknown retinal task: {task}")
+    return {
+        f"Class {i}": float(p)
+        for i, p in enumerate(probabilities)
+    }
 
 
-# ---------------------------------------------------------
-# DISPLAY RETINAL RESULTS
-# ---------------------------------------------------------
+# ============================================================
+# RETINAL DISEASE RESULTS
+# ============================================================
 
-def show_retinal_results(results):
-    st.subheader("👁️ Retinal Prediction Results")
+def show_disease_results(scores):
+    scores = np.asarray(scores).reshape(-1)
 
-    if not results:
-        st.info("No retinal prediction results are available.")
+    if len(scores) != len(DISEASE_LABELS):
+        st.error(
+            f"Expected {len(DISEASE_LABELS)} outputs; "
+            f"received {len(scores)}. Check the trained model."
+        )
         return
 
-    for name, result in results.items():
-        with st.container(border=True):
-            st.markdown(f"### {name}")
+    scores = np.clip(scores, 0, 1)
 
-            if isinstance(result, dict):
-                task = result.get("task")
+    st.markdown("### 🦠 Retinal Disease Results")
 
-                if task == "regression":
-                    st.metric(
-                        "Predicted value",
-                        f"{result['value']:.4f}",
-                    )
+    diabetes = float(scores[1])
+    diabetes_positive = diabetes >= DIABETES_THRESHOLD
 
-                elif task == "classification":
-                    st.write(
-                        f"**Predicted class:** {result['label']}"
-                    )
-                    st.metric(
-                        "Model confidence",
-                        f"{result['confidence'] * 100:.2f}%",
-                    )
+    col1, col2 = st.columns(2)
 
-                elif task == "multilabel":
-                    labels = result.get("labels", [])
+    with col1:
+        st.metric(
+            "Diabetes Retinal Model",
+            "Positive" if diabetes_positive else "Negative",
+            f"Score: {diabetes:.1%}",
+        )
 
-                    if labels:
-                        for item in labels:
-                            st.write(
-                                f"**{item['label']}** — "
-                                f"{item['score'] * 100:.2f}%"
-                            )
-                    else:
-                        st.info(
-                            "No labels crossed the 50% threshold. "
-                            "This does not prove that the image is normal."
-                        )
+    with col2:
+        # Overall positive if any non-normal disease score exceeds threshold.
+        disease_scores = scores[1:]
+        max_score = float(np.max(disease_scores))
+        disease_positive = max_score >= DISEASE_THRESHOLD
 
-                    scores = result.get("scores", [])
-                    if scores:
-                        labels = [
-                            DISEASE_LABELS[i]
-                            if i < len(DISEASE_LABELS)
-                            else f"Label {i}"
-                            for i in range(len(scores))
-                        ]
+        st.metric(
+            "Overall Retinal Disease",
+            "Positive" if disease_positive else "Negative",
+            f"Highest score: {max_score:.1%}",
+        )
 
-                        st.dataframe(
-                            pd.DataFrame({
-                                "Label": labels,
-                                "Score": [
-                                    round(float(x), 4)
-                                    for x in scores
-                                ],
-                            }),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
+    with st.expander("View all disease scores", expanded=True):
+        for label, score in zip(DISEASE_LABELS, scores):
+            st.write(f"**{label}:** {float(score):.1%}")
+            st.progress(float(score))
 
-                else:
-                    st.json(result)
-            else:
-                st.write(result)
-
-
-# ---------------------------------------------------------
-# GRAD-CAM PLACEHOLDER
-# ---------------------------------------------------------
-
-def show_gradcam(image, image_key):
-    """
-    Grad-CAM depends on the exact CNN architecture and target layer.
-    It is not fabricated here if those details are unavailable.
-    """
-    st.subheader("🔥 Grad-CAM Explainability")
-
-    st.info(
-        "Grad-CAM requires the original CNN architecture and its target "
-        "convolutional layer. Configure those from the retinal model's "
-        "training notebook before generating a valid heatmap."
+    st.caption(
+        "Research predictions only. The label mapping and thresholds "
+        "must be verified against the model's training configuration."
     )
 
 
-# ---------------------------------------------------------
-# IMAGE UPLOAD
-# ---------------------------------------------------------
+# ============================================================
+# CIMT THICKNESS RESULT
+# ============================================================
 
-st.header("📤 Upload Retinal / Fundus Image")
+def show_cimt_result(value):
+    st.markdown("### 🩺 CIMT Thickness")
 
-uploaded_file = st.file_uploader(
-    "Choose an image file",
-    type=["png", "jpg", "jpeg", "bmp", "webp"],
-    help="Upload a retinal fundus image in a supported image format.",
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.metric("Predicted CIMT Output", f"{float(value):.4f}")
+
+    with col2:
+        if CIMT_POSITIVE_THRESHOLD is None:
+            st.metric("CIMT Classification", "Not configured")
+            st.caption(
+                "Set CIMT_POSITIVE_THRESHOLD after confirming the "
+                "model output units and research cutoff."
+            )
+        else:
+            status = (
+                "Positive"
+                if float(value) >= CIMT_POSITIVE_THRESHOLD
+                else "Negative"
+            )
+            st.metric("CIMT Classification", status)
+            st.caption(
+                f"Configured research threshold: "
+                f"{CIMT_POSITIVE_THRESHOLD}"
+            )
+
+
+# ============================================================
+# RETINAL PREDICTION DISPLAY
+# ============================================================
+
+def show_retinal_results(results):
+    st.header("🔍 Retinal Prediction Results")
+
+    if not results:
+        st.warning("No retinal model produced a prediction.")
+        return
+
+    cols = st.columns(2)
+
+    for index, (name, result) in enumerate(results.items()):
+        with cols[index % 2]:
+            with st.container(border=True):
+                st.subheader(name)
+
+                if name == "Retinal Age":
+                    st.metric(
+                        "Estimated Age",
+                        f"{float(result):.1f} years",
+                    )
+
+                elif name == "Retinal Sex":
+                    if not isinstance(result, dict) or len(result) != 2:
+                        st.error("Sex model must return two class scores.")
+                    else:
+                        probabilities = list(result.values())
+                        idx = int(np.argmax(probabilities))
+
+                        st.metric(
+                            "Predicted Sex",
+                            SEX_CLASS_LABELS[idx],
+                        )
+                        st.write(
+                            f"Model score: {probabilities[idx]:.1%}"
+                        )
+                        st.caption(
+                            "Verify Female/Male order using training labels."
+                        )
+
+                elif name == "Retinal Disease":
+                    show_disease_results(result)
+
+                elif name == "CIMT Estimate":
+                    show_cimt_result(result)
+
+
+# ============================================================
+# FUSION MODEL AND METADATA
+# ============================================================
+
+def get_fusion_metadata():
+    if not FUSION_METADATA_PATH.is_file():
+        raise FileNotFoundError(
+            "fusion_metadata.json is missing."
+        )
+
+    with open(FUSION_METADATA_PATH, "r", encoding="utf-8") as file:
+        metadata = json.load(file)
+
+    required = {
+        "clinical_features",
+        "output_labels",
+        "image_input_name",
+        "clinical_input_name",
+        "image_size",
+    }
+
+    missing = required - set(metadata)
+
+    if missing:
+        raise ValueError(
+            f"Fusion metadata missing keys: {sorted(missing)}"
+        )
+
+    return metadata
+
+
+@st.cache_resource(show_spinner=False)
+def load_fusion_model(path_string, modified_time):
+    return tf.keras.models.load_model(
+        path_string,
+        compile=False,
+    )
+
+
+def convert_risk_score(score, metadata):
+    # Configure these boundaries according to the trained model/task.
+    low_max = float(metadata.get("risk_low_max", RISK_LOW_MAX))
+    medium_max = float(metadata.get("risk_medium_max", RISK_MEDIUM_MAX))
+
+    if not 0 <= low_max < medium_max <= 1:
+        raise ValueError("Invalid risk thresholds in metadata.")
+
+    if score < low_max:
+        return "Low"
+
+    if score < medium_max:
+        return "Medium"
+
+    return "High"
+
+
+# ============================================================
+# FUSION PREDICTION — SEPARATE RUN BUTTON
+# ============================================================
+
+def fusion_prediction_section(image, image_key):
+    st.divider()
+    st.header("❤️ Heart Disease Risk Prediction")
+
+    st.write(
+        "This separate prediction uses the selected retinal image "
+        "and clinical features together."
+    )
+
+    if not FUSION_MODEL_PATH.is_file():
+        st.warning(
+            f"Fusion model missing: {FUSION_MODEL_PATH.name}"
+        )
+        return
+
+    if not FUSION_METADATA_PATH.is_file():
+        st.warning(
+            "Fusion metadata missing. Actual inference requires the "
+            "training-time feature order, input names, preprocessing, "
+            "and output mapping."
+        )
+        return
+
+    try:
+        metadata = get_fusion_metadata()
+        model = load_fusion_model(
+            str(FUSION_MODEL_PATH),
+            FUSION_MODEL_PATH.stat().st_mtime,
+        )
+    except Exception as error:
+        st.error(f"Could not load fusion model: {error}")
+        return
+
+    clinical_features = metadata["clinical_features"]
+    values = {}
+
+    with st.form("heart_risk_form"):
+        st.subheader("Clinical Information")
+
+        columns = st.columns(2)
+
+        for i, feature in enumerate(clinical_features):
+            name = feature["name"]
+
+            label = feature.get("label", name)
+            minimum = float(feature.get("min", 0.0))
+            maximum = float(feature.get("max", 200.0))
+            default = float(feature.get("default", 0.0))
+            step = float(feature.get("step", 1.0))
+
+            if minimum > maximum:
+                st.error(f"Invalid range for {name}.")
+                return
+
+            default = min(max(default, minimum), maximum)
+
+            with columns[i % 2]:
+                values[name] = st.number_input(
+                    label,
+                    min_value=minimum,
+                    max_value=maximum,
+                    value=default,
+                    step=step,
+                    key=f"risk_{name}",
+                )
+
+        run_fusion = st.form_submit_button(
+            "❤️ Run Heart Disease Risk Prediction",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if run_fusion:
+        try:
+            image_size = int(metadata["image_size"])
+
+            image_array = np.asarray(
+                image.convert("RGB").resize(
+                    (image_size, image_size)
+                ),
+                dtype=np.float32,
+            )
+
+            preprocessing = metadata.get(
+                "image_preprocessing",
+                "rescale_0_1",
+            )
+
+            if preprocessing == "rescale_0_1":
+                image_array /= 255.0
+
+            elif preprocessing == "efficientnet":
+                image_array = (
+                    tf.keras.applications.efficientnet.preprocess_input(
+                        image_array
+                    )
+                )
+
+            elif preprocessing != "none":
+                raise ValueError(
+                    f"Unsupported preprocessing: {preprocessing}"
+                )
+
+            clinical_frame = pd.DataFrame(
+                [[values[f["name"]] for f in clinical_features]],
+                columns=[f["name"] for f in clinical_features],
+            )
+
+            if metadata.get("use_clinical_scaler", False):
+                if not CLINICAL_SCALER_PATH.is_file():
+                    raise FileNotFoundError(
+                        "Required clinical_scaler.pkl is missing."
+                    )
+
+                scaler = joblib.load(CLINICAL_SCALER_PATH)
+                clinical_array = scaler.transform(clinical_frame)
+            else:
+                clinical_array = clinical_frame.to_numpy(
+                    dtype=np.float32
+                )
+
+            image_name = metadata["image_input_name"]
+            clinical_name = metadata["clinical_input_name"]
+
+            model_names = [
+                tensor.name.split(":")[0].split("/")[-1]
+                for tensor in model.inputs
+            ]
+
+            if image_name not in model_names:
+                raise ValueError(
+                    f"Image input name mismatch. Actual inputs: {model_names}"
+                )
+
+            if clinical_name not in model_names:
+                raise ValueError(
+                    f"Clinical input name mismatch. Actual inputs: {model_names}"
+                )
+
+            inputs = {
+                image_name: image_array[np.newaxis, ...],
+                clinical_name: clinical_array.astype(np.float32),
+            }
+
+            prediction = model.predict(inputs, verbose=0)
+            prediction = np.asarray(prediction)
+
+            if prediction.ndim == 2 and prediction.shape[0] == 1:
+                prediction = prediction[0]
+            else:
+                prediction = prediction.reshape(-1)
+
+            prediction = finite_array(prediction)
+
+            output_type = metadata.get(
+                "output_type",
+                "probabilities",
+            )
+
+            if output_type == "logits":
+                prediction = (
+                    sigmoid(prediction)
+                    if len(prediction) == 1
+                    else softmax(prediction)
+                )
+
+            labels = metadata["output_labels"]
+
+            if output_type == "regression":
+                st.success("Fusion model prediction completed.")
+                st.metric(
+                    "Model Output",
+                    f"{float(prediction[0]):.4f}",
+                )
+                st.warning(
+                    "A regression value cannot be converted into Low, "
+                    "Medium or High without a justified mapping."
+                )
+                return
+
+            if len(prediction) != len(labels):
+                raise ValueError(
+                    "Output label count does not match model output."
+                )
+
+            if np.any(prediction < 0) or np.any(prediction > 1):
+                raise ValueError(
+                    "Output is not a probability. Verify output_type."
+                )
+
+            # Prefer the explicitly named heart-disease probability.
+            target_index = metadata.get("risk_output_index")
+
+            if target_index is None:
+                matches = [
+                    i for i, label in enumerate(labels)
+                    if str(label).lower() in (
+                        "heart disease",
+                        "heart_disease",
+                        "disease",
+                        "positive",
+                        "cad",
+                        "heart disease risk",
+                    )
+                ]
+
+                if len(matches) == 1:
+                    target_index = matches[0]
+                elif len(prediction) == 2:
+                    target_index = int(
+                        metadata.get("positive_class_index", 1)
+                    )
+                else:
+                    raise ValueError(
+                        "Specify risk_output_index in fusion_metadata.json "
+                        "to identify the heart-disease risk output."
+                    )
+
+            target_index = int(target_index)
+
+            if not 0 <= target_index < len(prediction):
+                raise ValueError("Invalid risk_output_index.")
+
+            risk_score = float(prediction[target_index])
+            risk_level = convert_risk_score(risk_score, metadata)
+
+            st.session_state.fusion_result = {
+                "score": risk_score,
+                "level": risk_level,
+                "labels": labels,
+                "probabilities": prediction.tolist(),
+            }
+            st.session_state.fusion_result_key = image_key
+
+        except Exception as error:
+            st.error(
+                f"Heart disease risk prediction failed: "
+                f"{type(error).__name__}: {error}"
+            )
+
+    result = st.session_state.fusion_result
+
+    if (
+        result is not None
+        and st.session_state.fusion_result_key == image_key
+    ):
+        st.markdown("### 📊 Heart Disease Risk Result")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.metric(
+                "Risk Level",
+                result["level"],
+            )
+
+        with col2:
+            st.metric(
+                "Model Risk Score",
+                f"{result['score']:.1%}",
+            )
+
+        for label, score in zip(
+            result["labels"],
+            result["probabilities"],
+        ):
+            st.write(f"**{label}:** {score:.1%}")
+            st.progress(float(np.clip(score, 0, 1)))
+
+        st.warning(
+            "Low/Medium/High boundaries are research configuration "
+            "values, not clinically validated risk categories."
+        )
+
+
+# ============================================================
+# GRAD-CAM
+# ============================================================
+
+def generate_gradcam(model, image, target_index=None):
+    # Grad-CAM assumes EfficientNet-B0 feature blocks and a
+    # classification output. Other architectures need a new target layer.
+    if not hasattr(model, "features"):
+        raise ValueError(
+            "Grad-CAM is configured for EfficientNet-style models only."
+        )
+
+    activations = []
+    gradients = []
+
+    target_layer = model.features[-1]
+
+    def forward_hook(module, inputs, output):
+        activations.append(output)
+
+    def backward_hook(module, grad_input, grad_output):
+        gradients.append(grad_output[0])
+
+    handle1 = target_layer.register_forward_hook(forward_hook)
+    handle2 = target_layer.register_full_backward_hook(backward_hook)
+
+    try:
+        tensor = TRANSFORM(
+            image.convert("RGB")
+        ).unsqueeze(0).to(DEVICE)
+
+        model.zero_grad(set_to_none=True)
+        output = get_output(model(tensor))
+
+        if output.ndim != 2 or output.shape[1] < 2:
+            raise ValueError(
+                "Grad-CAM needs a multi-class classification model."
+            )
+
+        if target_index is None:
+            target_index = int(output[0].argmax().item())
+
+        if not 0 <= target_index < output.shape[1]:
+            raise ValueError("Invalid Grad-CAM target class.")
+
+        output[0, target_index].backward()
+
+        feature_maps = activations[0]
+        grads = gradients[0]
+
+        weights = grads.mean(dim=(2, 3), keepdim=True)
+
+        cam = (weights * feature_maps).sum(dim=1, keepdim=True)
+        cam = F.relu(cam)
+
+        cam = F.interpolate(
+            cam,
+            size=(IMAGE_SIZE, IMAGE_SIZE),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        cam = cam[0, 0].detach().cpu().numpy()
+
+        if cam.max() > cam.min():
+            cam = (cam - cam.min()) / (cam.max() - cam.min())
+        else:
+            cam = np.zeros_like(cam)
+
+        return cam, target_index
+
+    finally:
+        handle1.remove()
+        handle2.remove()
+
+
+def show_gradcam(image, image_key):
+    st.divider()
+    st.header("🔥 Grad-CAM — Model Attention")
+
+    st.caption(
+        "Highlights image regions influencing the selected model's "
+        "classification output. This is an explanation visualization, "
+        "not a disease segmentation or proof of clinical reasoning."
+    )
+
+    available_models = []
+
+    for name, (filename, task) in MODEL_FILES.items():
+        if task in ("classification", "multilabel"):
+            if (MODEL_DIR / filename).is_file():
+                available_models.append(name)
+
+    if not available_models:
+        st.info(
+            "No compatible saved classification model was found "
+            "for Grad-CAM."
+        )
+        return
+
+    chosen = st.selectbox(
+        "Choose model for Grad-CAM",
+        available_models,
+        key="gradcam_model",
+    )
+
+    if st.button(
+        "🔥 Generate Grad-CAM",
+        type="primary",
+        key="generate_gradcam",
+    ):
+        filename, task = MODEL_FILES[chosen]
+        path = MODEL_DIR / filename
+
+        try:
+            model = load_retinal_model(
+                str(path),
+                task,
+                path.stat().st_mtime,
+            )
+
+            cam, class_index = generate_gradcam(model, image)
+
+            base = np.asarray(
+                image.convert("RGB").resize(
+                    (IMAGE_SIZE, IMAGE_SIZE)
+                ),
+                dtype=np.float32,
+            ) / 255.0
+
+            # Pure NumPy heatmap avoids extra plotting dependencies.
+            heat = np.zeros_like(base)
+            heat[..., 0] = cam
+            heat[..., 1] = np.maximum(0, 1 - np.abs(cam - 0.5) * 2)
+            heat[..., 2] = 1 - cam
+
+            overlay = np.clip(
+                0.55 * base + 0.45 * heat,
+                0,
+                1,
+            )
+
+            overlay_image = Image.fromarray(
+                (overlay * 255).astype(np.uint8)
+            )
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.image(
+                    image,
+                    caption="Original retinal image",
+                    use_container_width=True,
+                )
+
+            with col2:
+                st.image(
+                    overlay_image,
+                    caption=f"Grad-CAM — class index {class_index}",
+                    use_container_width=True,
+                )
+
+        except Exception as error:
+            st.error(
+                f"Grad-CAM failed: {type(error).__name__}: {error}"
+            )
+
+
+# ============================================================
+# SIDEBAR MODEL STATUS
+# ============================================================
+
+st.sidebar.title("👁️ Retina AI")
+st.sidebar.write("Research Prediction Dashboard")
+st.sidebar.caption(f"Device: {DEVICE}")
+
+st.sidebar.subheader("Retinal Models")
+
+for name, (filename, task) in MODEL_FILES.items():
+    path = MODEL_DIR / filename
+
+    if path.is_file():
+        st.sidebar.success(f"{name}: Found")
+    else:
+        st.sidebar.error(f"{name}: Missing")
+
+st.sidebar.subheader("Fusion Files")
+
+for name, path in [
+    ("Fusion Model", FUSION_MODEL_PATH),
+    ("Clinical Scaler", CLINICAL_SCALER_PATH),
+    ("Fusion Metadata", FUSION_METADATA_PATH),
+    ("CAD Model", CAD_MODEL_PATH),
+]:
+    if path.is_file():
+        st.sidebar.success(f"{name}: Found")
+    else:
+        st.sidebar.info(f"{name}: Missing")
+
+
+# ============================================================
+# MAIN DASHBOARD
+# ============================================================
+
+st.title("👁️ Retina AI Research Dashboard")
+
+st.caption(
+    "Upload a retinal image once, then run retinal analysis "
+    "and heart-disease risk prediction separately."
 )
+
+st.warning(
+    "Research prototype only. Not a confirmed medical diagnosis."
+)
+
+
+# ============================================================
+# IMAGE INPUT
+# ============================================================
+
+upload_col, camera_col = st.columns(2)
+
+with upload_col:
+    st.subheader("🖼️ Upload Retinal Image")
+
+    uploaded_file = st.file_uploader(
+        "Choose image",
+        type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"],
+        key="retina_upload",
+    )
+
+with camera_col:
+    st.subheader("📷 Capture Retinal Image")
+
+    camera_photo = st.camera_input(
+        "Capture fundus image",
+        key="retina_camera",
+    )
+
+
+# ============================================================
+# LOAD AND DISPLAY SELECTED IMAGE
+# ============================================================
 
 image = None
 image_key = None
 
-if uploaded_file is not None:
-    try:
-        image = prepare_image(uploaded_file)
-        image_key = get_image_key(uploaded_file)
+try:
+    if uploaded_file is not None:
+        raw = uploaded_file.getvalue()
+        image = Image.open(io.BytesIO(raw)).convert("RGB").copy()
+        image_key = hash_bytes(raw)
 
-        # Clear results when the uploaded image changes.
-        if st.session_state["last_image_key"] != image_key:
-            st.session_state["retinal_results"] = None
-            st.session_state["retinal_result_key"] = None
-            st.session_state["cad_prediction_result"] = None
-            st.session_state["last_image_key"] = image_key
+    elif camera_photo is not None:
+        raw = camera_photo.getvalue()
+        image = Image.open(io.BytesIO(raw)).convert("RGB").copy()
+        image_key = hash_bytes(raw)
 
-    except Exception as error:
-        st.error(
-            f"Could not open the uploaded image: "
-            f"{type(error).__name__}: {error}"
-        )
+except Exception as error:
+    st.error(f"Could not open image: {error}")
 
 
-# ---------------------------------------------------------
-# SHOW IMAGE CORRECTLY
-# ---------------------------------------------------------
+if image_key != st.session_state.selected_image_key:
+    st.session_state.selected_image_key = image_key
+    st.session_state.retinal_results = None
+    st.session_state.retinal_result_key = None
+    st.session_state.fusion_result = None
+    st.session_state.fusion_result_key = None
+    st.session_state.gradcam_key = None
+
 
 if image is not None:
     st.divider()
-    st.header("📷 Selected Retinal Image")
+    st.subheader("📷 Selected Retinal Image")
 
-    image_col, info_col = st.columns([1, 1])
+    preview_col, details_col = st.columns([1, 1])
 
-    with image_col:
-        # IMPORTANT: Display the PIL image directly.
-        # Do not construct an HTML <img> tag or a local file URL.
+    with preview_col:
         st.image(
             image,
             caption="Uploaded Retinal / Fundus Image",
             use_container_width=True,
         )
 
-    with info_col:
-        st.subheader("Image Information")
+    with details_col:
+        st.markdown("### Image Information")
         st.write(f"**Width:** {image.width} px")
         st.write(f"**Height:** {image.height} px")
-        st.write(f"**Format:** {image.format or 'RGB image'}")
         st.write(f"**Device:** {DEVICE}")
 
+    # Two distinct run options, as requested.
     st.divider()
-
-    # -----------------------------------------------------
-    # TWO PREDICTION OPTIONS
-    # -----------------------------------------------------
-
     st.header("Choose Prediction")
 
-    option = st.radio(
-        "Select which prediction to run:",
-        [
-            "❤️ Heart Disease Risk",
-            "👁️ Retinal Prediction Results",
-        ],
-        horizontal=True,
-        key="prediction_option",
-    )
+    retinal_col, heart_col = st.columns(2)
 
-    if option == "❤️ Heart Disease Risk":
-        heart_disease_section()
+    with retinal_col:
+        st.markdown("### 👁️ Retinal Analysis")
 
-    else:
-        st.subheader("👁️ Retinal Prediction Results")
-
-        if st.button(
+        run_retinal = st.button(
             "🔍 Run Retinal Prediction",
             type="primary",
             use_container_width=True,
             key="run_retinal",
-        ):
-            results = {}
+        )
 
-            with st.spinner("Running retinal models..."):
-                for name, (filename, task) in MODEL_FILES.items():
-                    model_path = MODEL_DIR / filename
+    with heart_col:
+        st.markdown("### ❤️ Heart Disease Risk")
 
-                    try:
-                        model = load_retinal_model(
-                            str(model_path),
-                            task,
-                            (
-                                model_path.stat().st_mtime
-                                if model_path.exists()
-                                else 0
-                            ),
-                        )
+        st.caption(
+            "Uses the same image plus clinical inputs below."
+        )
 
-                        results[name] = retinal_predict(
-                            model,
-                            image,
-                            task,
-                        )
+    if run_retinal:
+        results = {}
 
-                    except Exception as error:
-                        st.error(
-                            f"**{name}** — "
-                            f"{type(error).__name__}: {error}"
-                        )
+        with st.spinner("Running retinal models..."):
+            for name, (filename, task) in MODEL_FILES.items():
+                path = MODEL_DIR / filename
 
-            st.session_state["retinal_results"] = results
-            st.session_state["retinal_result_key"] = image_key
+                try:
+                    model = load_retinal_model(
+                        str(path),
+                        task,
+                        path.stat().st_mtime,
+                    )
 
-        if (
-            st.session_state["retinal_results"] is not None
-            and st.session_state["retinal_result_key"] == image_key
-        ):
-            show_retinal_results(
-                st.session_state["retinal_results"]
-            )
+                    result = retinal_predict(
+                        model,
+                        image,
+                        task,
+                    )
 
-            show_gradcam(image, image_key)
+                    results[name] = result
+
+                except Exception as error:
+                    st.error(
+                        f"{name}: {type(error).__name__}: {error}"
+                    )
+
+        st.session_state.retinal_results = results
+        st.session_state.retinal_result_key = image_key
+
+    if (
+        st.session_state.retinal_results is not None
+        and st.session_state.retinal_result_key == image_key
+    ):
+        show_retinal_results(
+            st.session_state.retinal_results
+        )
+
+    # The fusion form has its own independent submit button.
+    fusion_prediction_section(image, image_key)
+
+    # Grad-CAM is shown at the end of the dashboard.
+    show_gradcam(image, image_key)
 
 else:
     st.info(
-        "Upload a retinal image above to display the image and select "
-        "one of the two prediction options."
+        "Upload or capture a retinal image. The preview and prediction "
+        "options will appear after an image is selected."
     )
 
+    st.subheader("❤️ Heart Disease Risk Prediction")
+    st.info(
+        "A retinal image is required before entering clinical data "
+        "and running the fusion model."
+    )
 
-# ---------------------------------------------------------
+    st.subheader("🔥 Grad-CAM")
+    st.info("Upload a retinal image to enable Grad-CAM.")
+
+# ============================================================
 # FOOTER
-# ---------------------------------------------------------
+# ============================================================
 
 st.divider()
 
 st.caption(
-    "Retina AI Research Prediction Dashboard | Academic research use only. "
-    "Predictions are not a substitute for professional medical evaluation."
+    "Retina AI Research Dashboard | Experimental research only | "
+    "Not validated for clinical diagnosis."
+)
+
+st.sidebar.caption(
+    "Camera access may require browser permission and HTTPS."
 )
