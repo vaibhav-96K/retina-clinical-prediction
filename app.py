@@ -945,27 +945,27 @@ if image is not None:
     st.divider()
     st.subheader("📷 Selected Retinal Image")
 
+  
     preview_col, details_col = st.columns([1, 1])
 
     with preview_col:
-        st.image(
-            image.convert("RGB"),
-            caption="Uploaded Retinal / Fundus Image",
-            use_container_width=True,
-        )
+        st.markdown("### Uploaded Retinal Image")
+
+        try:
+            preview = image.convert("RGB").copy()
+            st.image(
+                preview,
+                caption="Uploaded Retinal / Fundus Image",
+                width=400,
+            )
+        except Exception as e:
+            st.error(f"Image preview error: {e}")
 
     with details_col:
         st.markdown("### Image Information")
         st.write(f"**Width:** {image.width} px")
         st.write(f"**Height:** {image.height} px")
         st.write("**Format:** RGB")
-        st.write(f"**Device:** {DEVICE}")
-
-    with details_col:
-        st.markdown("### Image Information")
-        st.write(f"**Width:** {image.width} px")
-        st.write(f"**Height:** {image.height} px")
-        st.write(f"**Format:** RGB")
         st.write(f"**Device:** {DEVICE}")
 
     st.divider()
