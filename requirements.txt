@@ -6,3 +6,4 @@ torchvision
 pandas
 joblib==1.6.0
 scikit-learn==1.6.1
+tensorflow
