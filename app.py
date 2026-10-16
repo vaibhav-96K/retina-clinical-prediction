@@ -58,7 +58,6 @@ MODEL_FILES = {
     "Retinal Age": ("retina_age_model.pth", "regression"),
     "Retinal Sex": ("retina_sex_model_v2.pth", "classification"),
     "Retinal Disease": ("retina_disease_model.pth", "multilabel"),
-    "CIMT Estimate": ("cimt_any_eye_resnet18_v1.pth", "cimt_classification"),
 }
 DISEASE_LABELS = [
     "Normal", "Diabetes", "Glaucoma", "Cataract",
@@ -362,8 +361,6 @@ def show_retinal_results(results):
                         st.caption("Verify class order using training labels.")
                 elif name == "Retinal Disease":
                     show_disease_results(result)
-                elif name == "CIMT Estimate":
-                    show_cimt_result(result)
 
 
 # --------------------------- IMAGE-ONLY CIMT MODEL ---------------------------
