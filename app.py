@@ -368,8 +368,8 @@ def show_retinal_results(results):
 
 # --------------------------- IMAGE-ONLY CIMT MODEL ---------------------------
 
-IMAGE_ONLY_CIMT_MODEL_PATH = MODEL_DIR / "best_image_only_cimt.keras"
-IMAGE_ONLY_CIMT_RESULTS_PATH = MODEL_DIR / "evaluation_results.json"
+RETINA_AGE_DR_MODEL_PATH = MODEL_DIR / "retina_age_dr_model.keras"
+("Retina Age/DR Model", RETINA_AGE_DR_MODEL_PATH),
 
 
 @st.cache_resource(show_spinner=False)
