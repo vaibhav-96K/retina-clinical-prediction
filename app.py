@@ -368,8 +368,7 @@ def show_retinal_results(results):
 
 # --------------------------- IMAGE-ONLY CIMT MODEL ---------------------------
 
-IMAGE_ONLY_CIMT_MODEL_PATH = MODEL_DIR / "best_image_only_cimt.keras"
-
+IMAGE_ONLY_CIMT_MODEL_PATH = MODEL_DIR / "image_only_cimt_final.keras"
 IMAGE_ONLY_CIMT_EVALUATION_PATH = MODEL_DIR / "evaluation_results.json"
 
 @st.cache_resource(show_spinner=False)
