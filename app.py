@@ -58,7 +58,7 @@ MODEL_FILES = {
     "Retinal Age": ("retina_age_model.pth", "regression"),
     "Retinal Sex": ("retina_sex_model_v2.pth", "classification"),
     "Retinal Disease": ("retina_disease_model.pth", "multilabel"),
-    "CIMT Estimate": ("cimt_thickness_model.pth", "regression"),
+    "CIMT Estimate": ("cimt_any_eye_resnet18_v1.pth", "cimt_classification"),
 }
 DISEASE_LABELS = [
     "Normal", "Diabetes", "Glaucoma", "Cataract",
@@ -96,8 +96,6 @@ DEFAULTS = {
     "fusion_result": None,
     "fusion_result_key": None,
     "cad_result": None,
-    "cimt_resnet_result": None,
-    "cimt_resnet_result_key": None,
 }
 for key, default in DEFAULTS.items():
     if key not in st.session_state:
@@ -185,25 +183,53 @@ def load_retinal_model(path_string, task, modified_time):
     else:
         state = clean_state_dict(extract_state_dict(checkpoint))
 
-        # This reconstruction assumes EfficientNet-B0 was used in training.
-        if task == "multilabel":
-            output_size = len(DISEASE_LABELS)
-        elif task == "classification":
-            weight = state.get("classifier.1.weight")
-            if weight is None:
+        # CIMT model: trained as torchvision ResNet-18 with a Sequential
+        # classifier whose Linear layer is fc.1 (checkpoint confirms this).
+        if task == "cimt_classification":
+            architecture = checkpoint.get("architecture") if isinstance(checkpoint, dict) else None
+            if architecture != "ResNet18_single_fundus_image_any_eye":
                 raise ValueError(
-                    "Cannot infer classifier size from this checkpoint. "
-                    "Use the original model architecture from training."
+                    "Unexpected CIMT architecture metadata: "
+                    f"{architecture!r}. Expected ResNet18_single_fundus_image_any_eye."
                 )
-            output_size = int(weight.shape[0])
+            weight = state.get("fc.1.weight")
+            bias = state.get("fc.1.bias")
+            if weight is None or bias is None or tuple(weight.shape) != (2, 512):
+                raise ValueError(
+                    "CIMT checkpoint must contain fc.1.weight (2, 512) and fc.1.bias."
+                )
+            model = models.resnet18(weights=None)
+            model.fc = nn.Sequential(
+                nn.Dropout(p=0.5),
+                nn.Linear(model.fc.in_features, int(weight.shape[0])),
+            )
+            model.load_state_dict(state, strict=True)
+            class_map = checkpoint.get("class_names", {"0": "normal_CIMT", "1": "thickened_CIMT"})
+            model._cimt_class_names = [
+                str(class_map.get("0", "normal_CIMT")),
+                str(class_map.get("1", "thickened_CIMT")),
+            ]
+            model._cimt_threshold = float(checkpoint.get("threshold", 0.5))
         else:
-            output_size = 1
+            # Existing retinal checkpoints use the app's EfficientNet-B0 loader.
+            if task == "multilabel":
+                output_size = len(DISEASE_LABELS)
+            elif task == "classification":
+                weight = state.get("classifier.1.weight")
+                if weight is None:
+                    raise ValueError(
+                        "Cannot infer classifier size from this checkpoint. "
+                        "Use the original model architecture from training."
+                    )
+                output_size = int(weight.shape[0])
+            else:
+                output_size = 1
 
-        model = models.efficientnet_b0(weights=None)
-        model.classifier[1] = nn.Linear(
-            model.classifier[1].in_features, output_size
-        )
-        model.load_state_dict(state, strict=True)
+            model = models.efficientnet_b0(weights=None)
+            model.classifier[1] = nn.Linear(
+                model.classifier[1].in_features, output_size
+            )
+            model.load_state_dict(state, strict=True)
 
     model = model.to(DEVICE).eval()
     return model
@@ -219,6 +245,16 @@ def retinal_predict(model, image, task):
 
     if task == "regression":
         return float(values[0])
+
+    if task == "cimt_classification":
+        probabilities = softmax(values)
+        labels = getattr(model, "_cimt_class_names", ["normal_CIMT", "thickened_CIMT"])
+        return {
+            "probabilities": {labels[i]: float(probabilities[i]) for i in range(min(2, len(probabilities)))},
+            "predicted_class": labels[int(np.argmax(probabilities))],
+            "confidence": float(np.max(probabilities)),
+            "threshold": float(getattr(model, "_cimt_threshold", 0.5)),
+        }
 
     if task == "multilabel":
         # Verify whether the training code used sigmoid logits or probabilities.
@@ -274,24 +310,37 @@ def show_disease_results(scores):
     )
 
 
-def show_cimt_result(value):
-    st.markdown("### 🩺 CIMT Thickness")
+def show_cimt_result(result):
+    st.markdown("### 🩺 CIMT Classification")
+    if not isinstance(result, dict) or "probabilities" not in result:
+        st.error("CIMT model returned an unexpected result format.")
+        return
+
+    predicted = result.get("predicted_class", "Unknown")
+    confidence = float(result.get("confidence", 0.0))
+    probabilities = result.get("probabilities", {})
     col1, col2 = st.columns(2)
     with col1:
-        st.metric("Predicted CIMT Output", f"{float(value):.4f}")
+        display_name = {
+            "normal_CIMT": "Normal CIMT",
+            "thickened_CIMT": "Thickened CIMT",
+        }.get(predicted, predicted)
+        st.metric("Predicted CIMT Class", display_name)
     with col2:
-        if CIMT_POSITIVE_THRESHOLD is None:
-            st.metric("CIMT Classification", "Not configured")
-            st.caption(
-                "Set a threshold only after verifying model output units "
-                "and a justified research cutoff."
-            )
-        else:
-            status = (
-                "Positive" if float(value) >= CIMT_POSITIVE_THRESHOLD
-                else "Negative"
-            )
-            st.metric("CIMT Classification", status)
+        st.metric("Prediction confidence", f"{confidence:.1%}")
+
+    for label, probability in probabilities.items():
+        display_label = {
+            "normal_CIMT": "Normal CIMT",
+            "thickened_CIMT": "Thickened CIMT",
+        }.get(label, label)
+        st.write(f"**{display_label}:** {float(probability):.1%}")
+        st.progress(float(np.clip(probability, 0, 1)))
+
+    st.caption(
+        "Research classification from one fundus image. This is not a direct "
+        "measurement of CIMT thickness and is not a clinical diagnosis."
+    )
 
 
 def show_retinal_results(results):
@@ -320,117 +369,6 @@ def show_retinal_results(results):
                     show_disease_results(result)
                 elif name == "CIMT Estimate":
                     show_cimt_result(result)
-
-
-
-# --------------------------- TRAINED CIMT RESNET-18 MODEL ---------------------------
-
-CIMT_RESNET_PATH = MODEL_DIR / "cimt_any_eye_resnet18_v1.pth"
-CIMT_CLASS_LABELS = ["Normal CIMT", "Thickened CIMT"]
-
-@st.cache_resource(show_spinner=False)
-def load_cimt_resnet18(path_string, modified_time):
-    """Load the saved ResNet-18 CIMT classifier trained in the project notebook."""
-    path = Path(path_string)
-    if not path.is_file():
-        raise FileNotFoundError(f"Missing trained CIMT model: {path}")
-
-    try:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        checkpoint = torch.load(path, map_location="cpu")
-
-    if isinstance(checkpoint, nn.Module):
-        model = checkpoint
-    else:
-        state = clean_state_dict(extract_state_dict(checkpoint))
-        fc_weight = state.get("fc.weight")
-        if fc_weight is None:
-            raise ValueError(
-                "This checkpoint does not contain 'fc.weight'. "
-                "The training model's ResNet-18 classifier architecture is needed."
-            )
-        output_size = int(fc_weight.shape[0])
-        model = models.resnet18(weights=None)
-        model.fc = nn.Linear(model.fc.in_features, output_size)
-        model.load_state_dict(state, strict=True)
-
-    model = model.to(DEVICE).eval()
-    return model
-
-
-def predict_cimt_resnet18(model, image):
-    """Predict Normal CIMT vs Thickened CIMT using ImageNet normalization."""
-    tensor = TRANSFORM(image.convert("RGB")).unsqueeze(0).to(DEVICE)
-    with torch.inference_mode():
-        output = get_output(model(tensor))
-    values = finite_array(output.detach().float().cpu().numpy().reshape(-1))
-
-    if len(values) == 1:
-        positive_probability = float(sigmoid(values)[0])
-        probabilities = np.array([1.0 - positive_probability, positive_probability])
-    elif len(values) == 2:
-        probabilities = softmax(values)
-    else:
-        raise ValueError(
-            f"Expected 1 or 2 classifier outputs, received {len(values)}."
-        )
-
-    class_index = int(np.argmax(probabilities))
-    return {
-        "label": CIMT_CLASS_LABELS[class_index],
-        "confidence": float(probabilities[class_index]),
-        "normal_probability": float(probabilities[0]),
-        "thickened_probability": float(probabilities[1]),
-    }
-
-
-def show_cimt_resnet18_section(image, image_key):
-    st.divider()
-    st.header("🩺 CIMT Classification — Trained ResNet-18")
-    st.caption(
-        "Uses the saved CIMT classifier. This predicts Normal vs Thickened CIMT; "
-        "it is not a direct heart-disease diagnosis."
-    )
-
-    if not CIMT_RESNET_PATH.is_file():
-        st.warning(f"Trained CIMT model not found: `{CIMT_RESNET_PATH}`")
-        return
-
-    if st.button(
-        "🩺 Run CIMT Prediction",
-        type="primary",
-        use_container_width=True,
-        key="run_cimt_resnet18",
-    ):
-        try:
-            with st.spinner("Loading trained ResNet-18 and analyzing image..."):
-                model = load_cimt_resnet18(
-                    str(CIMT_RESNET_PATH), CIMT_RESNET_PATH.stat().st_mtime
-                )
-                result = predict_cimt_resnet18(model, image)
-            st.session_state["cimt_resnet_result"] = result
-            st.session_state["cimt_resnet_result_key"] = image_key
-        except Exception as error:
-            st.error(f"CIMT prediction failed: {type(error).__name__}: {error}")
-
-    result = st.session_state.get("cimt_resnet_result")
-    result_key = st.session_state.get("cimt_resnet_result_key")
-    if result is not None and result_key == image_key:
-        c1, c2 = st.columns(2)
-        with c1:
-            st.metric("Predicted CIMT Class", result["label"])
-        with c2:
-            st.metric("Prediction Confidence", f'{result["confidence"]:.1%}')
-        st.write(f'**Normal CIMT probability:** {result["normal_probability"]:.1%}')
-        st.progress(float(np.clip(result["normal_probability"], 0, 1)))
-        st.write(f'**Thickened CIMT probability:** {result["thickened_probability"]:.1%}')
-        st.progress(float(np.clip(result["thickened_probability"], 0, 1)))
-        st.caption(
-            "Held-out test results from training: accuracy 76.00%, "
-            "sensitivity 92.00%, specificity 60.00%, ROC-AUC 0.8290. "
-            "Research use only; not clinically validated."
-        )
 
 
 # --------------------------- FUSION MODEL ---------------------------
@@ -1091,8 +1029,6 @@ if image_key != st.session_state.selected_image_key:
     st.session_state.fusion_result = None
     st.session_state.fusion_result_key = None
     st.session_state.cad_result = None
-    st.session_state.cimt_resnet_result = None
-    st.session_state.cimt_resnet_result_key = None
 
 # --------------------------- IMAGE PREVIEW ---------------------------
 
@@ -1166,9 +1102,6 @@ if image is not None:
         and st.session_state.retinal_result_key == image_key
     ):
         show_retinal_results(st.session_state.retinal_results)
-
-    # Trained ResNet-18 CIMT classifier is separate from the other retinal models.
-    show_cimt_resnet18_section(image, image_key)
 
     # Fusion model section remains separate from retinal predictions.
     fusion_prediction_section(image, image_key)
