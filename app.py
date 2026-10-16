@@ -15,7 +15,9 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import joblib
-from PIL import Image, ImageOps
+from PIL import Image
+import io
+import hashlib
 
 import torch
 import torch.nn as nn
@@ -56,7 +58,7 @@ MODEL_FILES = {
     "Retinal Age": ("retina_age_model.pth", "regression"),
     "Retinal Sex": ("retina_sex_model_v2.pth", "classification"),
     "Retinal Disease": ("retina_disease_model.pth", "multilabel"),
-    "CIMT Estimate": ("cimt_thickness_model.pth", "regression"),
+    "CIMT Estimate": ("cimt_any_eye_resnet18_v1.pth", "cimt_classification"),
 }
 DISEASE_LABELS = [
     "Normal", "Diabetes", "Glaucoma", "Cataract",
@@ -69,9 +71,6 @@ DIABETES_THRESHOLD = 0.50
 CIMT_POSITIVE_THRESHOLD = None
 
 CAD_MODEL_PATH = MODEL_DIR / "cad_heart_disease_model.joblib"
-FUSION_MODEL_PATH = MODEL_DIR / "retinal_feature_fusion_model_FINAL.keras"
-CLINICAL_SCALER_PATH = MODEL_DIR / "clinical_scaler.pkl"
-FUSION_METADATA_PATH = MODEL_DIR / "fusion_metadata.json"
 
 RISK_LOW_MAX = 0.33
 RISK_MEDIUM_MAX = 0.66
@@ -91,8 +90,6 @@ DEFAULTS = {
     "selected_image_key": None,
     "retinal_results": None,
     "retinal_result_key": None,
-    "fusion_result": None,
-    "fusion_result_key": None,
     "cad_result": None,
 }
 for key, default in DEFAULTS.items():
@@ -181,25 +178,53 @@ def load_retinal_model(path_string, task, modified_time):
     else:
         state = clean_state_dict(extract_state_dict(checkpoint))
 
-        # This reconstruction assumes EfficientNet-B0 was used in training.
-        if task == "multilabel":
-            output_size = len(DISEASE_LABELS)
-        elif task == "classification":
-            weight = state.get("classifier.1.weight")
-            if weight is None:
+        # CIMT model: trained as torchvision ResNet-18 with a Sequential
+        # classifier whose Linear layer is fc.1 (checkpoint confirms this).
+        if task == "cimt_classification":
+            architecture = checkpoint.get("architecture") if isinstance(checkpoint, dict) else None
+            if architecture != "ResNet18_single_fundus_image_any_eye":
                 raise ValueError(
-                    "Cannot infer classifier size from this checkpoint. "
-                    "Use the original model architecture from training."
+                    "Unexpected CIMT architecture metadata: "
+                    f"{architecture!r}. Expected ResNet18_single_fundus_image_any_eye."
                 )
-            output_size = int(weight.shape[0])
+            weight = state.get("fc.1.weight")
+            bias = state.get("fc.1.bias")
+            if weight is None or bias is None or tuple(weight.shape) != (2, 512):
+                raise ValueError(
+                    "CIMT checkpoint must contain fc.1.weight (2, 512) and fc.1.bias."
+                )
+            model = models.resnet18(weights=None)
+            model.fc = nn.Sequential(
+                nn.Dropout(p=0.5),
+                nn.Linear(model.fc.in_features, int(weight.shape[0])),
+            )
+            model.load_state_dict(state, strict=True)
+            class_map = checkpoint.get("class_names", {"0": "normal_CIMT", "1": "thickened_CIMT"})
+            model._cimt_class_names = [
+                str(class_map.get("0", "normal_CIMT")),
+                str(class_map.get("1", "thickened_CIMT")),
+            ]
+            model._cimt_threshold = float(checkpoint.get("threshold", 0.5))
         else:
-            output_size = 1
+            # Existing retinal checkpoints use the app's EfficientNet-B0 loader.
+            if task == "multilabel":
+                output_size = len(DISEASE_LABELS)
+            elif task == "classification":
+                weight = state.get("classifier.1.weight")
+                if weight is None:
+                    raise ValueError(
+                        "Cannot infer classifier size from this checkpoint. "
+                        "Use the original model architecture from training."
+                    )
+                output_size = int(weight.shape[0])
+            else:
+                output_size = 1
 
-        model = models.efficientnet_b0(weights=None)
-        model.classifier[1] = nn.Linear(
-            model.classifier[1].in_features, output_size
-        )
-        model.load_state_dict(state, strict=True)
+            model = models.efficientnet_b0(weights=None)
+            model.classifier[1] = nn.Linear(
+                model.classifier[1].in_features, output_size
+            )
+            model.load_state_dict(state, strict=True)
 
     model = model.to(DEVICE).eval()
     return model
@@ -215,6 +240,16 @@ def retinal_predict(model, image, task):
 
     if task == "regression":
         return float(values[0])
+
+    if task == "cimt_classification":
+        probabilities = softmax(values)
+        labels = getattr(model, "_cimt_class_names", ["normal_CIMT", "thickened_CIMT"])
+        return {
+            "probabilities": {labels[i]: float(probabilities[i]) for i in range(min(2, len(probabilities)))},
+            "predicted_class": labels[int(np.argmax(probabilities))],
+            "confidence": float(np.max(probabilities)),
+            "threshold": float(getattr(model, "_cimt_threshold", 0.5)),
+        }
 
     if task == "multilabel":
         # Verify whether the training code used sigmoid logits or probabilities.
@@ -270,24 +305,37 @@ def show_disease_results(scores):
     )
 
 
-def show_cimt_result(value):
-    st.markdown("### 🩺 CIMT Thickness")
+def show_cimt_result(result):
+    st.markdown("### 🩺 CIMT Classification")
+    if not isinstance(result, dict) or "probabilities" not in result:
+        st.error("CIMT model returned an unexpected result format.")
+        return
+
+    predicted = result.get("predicted_class", "Unknown")
+    confidence = float(result.get("confidence", 0.0))
+    probabilities = result.get("probabilities", {})
     col1, col2 = st.columns(2)
     with col1:
-        st.metric("Predicted CIMT Output", f"{float(value):.4f}")
+        display_name = {
+            "normal_CIMT": "Normal CIMT",
+            "thickened_CIMT": "Thickened CIMT",
+        }.get(predicted, predicted)
+        st.metric("Predicted CIMT Class", display_name)
     with col2:
-        if CIMT_POSITIVE_THRESHOLD is None:
-            st.metric("CIMT Classification", "Not configured")
-            st.caption(
-                "Set a threshold only after verifying model output units "
-                "and a justified research cutoff."
-            )
-        else:
-            status = (
-                "Positive" if float(value) >= CIMT_POSITIVE_THRESHOLD
-                else "Negative"
-            )
-            st.metric("CIMT Classification", status)
+        st.metric("Prediction confidence", f"{confidence:.1%}")
+
+    for label, probability in probabilities.items():
+        display_label = {
+            "normal_CIMT": "Normal CIMT",
+            "thickened_CIMT": "Thickened CIMT",
+        }.get(label, label)
+        st.write(f"**{display_label}:** {float(probability):.1%}")
+        st.progress(float(np.clip(probability, 0, 1)))
+
+    st.caption(
+        "Research classification from one fundus image. This is not a direct "
+        "measurement of CIMT thickness and is not a clinical diagnosis."
+    )
 
 
 def show_retinal_results(results):
@@ -318,239 +366,113 @@ def show_retinal_results(results):
                     show_cimt_result(result)
 
 
-# --------------------------- FUSION MODEL ---------------------------
+# --------------------------- IMAGE-ONLY CIMT MODEL ---------------------------
 
-def get_fusion_metadata():
-    if not FUSION_METADATA_PATH.is_file():
-        raise FileNotFoundError("fusion_metadata.json is missing.")
-    with open(FUSION_METADATA_PATH, "r", encoding="utf-8") as file:
-        metadata = json.load(file)
-
-    required = {
-        "clinical_features", "output_labels",
-        "image_input_name", "clinical_input_name", "image_size",
-    }
-    missing = required - set(metadata)
-    if missing:
-        raise ValueError(f"Fusion metadata missing keys: {sorted(missing)}")
-    return metadata
+IMAGE_ONLY_CIMT_MODEL_PATH = MODEL_DIR / "best_image_only_cimt.keras"
+IMAGE_ONLY_CIMT_RESULTS_PATH = MODEL_DIR / "evaluation_results.json"
 
 
 @st.cache_resource(show_spinner=False)
-def load_fusion_model(path_string, modified_time):
+def load_image_only_cimt_model(path_string, modified_time):
     return tf.keras.models.load_model(path_string, compile=False)
 
 
-def convert_risk_score(score, metadata):
-    low_max = float(metadata.get("risk_low_max", RISK_LOW_MAX))
-    medium_max = float(metadata.get("risk_medium_max", RISK_MEDIUM_MAX))
-    if not 0 <= low_max < medium_max <= 1:
-        raise ValueError("Invalid risk thresholds in fusion metadata.")
-    if score < low_max:
-        return "Low"
-    if score < medium_max:
-        return "Medium"
-    return "High"
-
-
-def fusion_prediction_section(image, image_key):
+def image_only_cimt_prediction_section(image):
     st.divider()
-    st.header("❤️ Heart Disease Prediction — Fusion Model")
-    st.write(
-        "This section requires a trained image-plus-clinical fusion model "
-        "and matching metadata. It is separate from the retinal results."
+    st.header("🩺 Retinal Image-only CIMT Classification")
+    st.caption(
+        "Uses the newly trained retinal image model. This predicts CIMT class, "
+        "not heart disease directly and not a measured CIMT thickness."
     )
 
-    if not FUSION_MODEL_PATH.is_file():
+    if not IMAGE_ONLY_CIMT_MODEL_PATH.is_file():
         st.warning(
-            f"Fusion model not found: `{FUSION_MODEL_PATH}`. "
-            "The fusion prediction cannot run until this trained model is supplied."
-        )
-        return
-    if not FUSION_METADATA_PATH.is_file():
-        st.warning(
-            "fusion_metadata.json is missing. The app needs the training-time "
-            "feature order, input names, preprocessing and output mapping."
+            f"Model file not found: `{IMAGE_ONLY_CIMT_MODEL_PATH}`. "
+            "Upload best_image_only_cimt.keras into the app's models folder."
         )
         return
 
-    try:
-        metadata = get_fusion_metadata()
-        model = load_fusion_model(
-            str(FUSION_MODEL_PATH), FUSION_MODEL_PATH.stat().st_mtime
-        )
-    except Exception as error:
-        st.error(f"Could not load fusion model: {type(error).__name__}: {error}")
-        return
-
-    clinical_features = metadata["clinical_features"]
-    values = {}
-
-    with st.form("heart_risk_form"):
-        st.subheader("Clinical Information")
-        columns = st.columns(2)
-        for i, feature in enumerate(clinical_features):
-            name = feature["name"]
-            label = feature.get("label", name)
-            minimum = float(feature.get("min", 0.0))
-            maximum = float(feature.get("max", 200.0))
-            default = float(feature.get("default", 0.0))
-            step = float(feature.get("step", 1.0))
-            if minimum > maximum:
-                st.error(f"Invalid range for {name}.")
-                return
-            default = min(max(default, minimum), maximum)
-            with columns[i % 2]:
-                values[name] = st.number_input(
-                    label,
-                    min_value=minimum,
-                    max_value=maximum,
-                    value=default,
-                    step=step,
-                    key=f"fusion_{name}",
-                )
-
-        run_fusion = st.form_submit_button(
-            "❤️ Run Heart Disease Risk Prediction",
-            type="primary",
-            use_container_width=True,
-        )
-
-    if run_fusion:
+    saved_results = {}
+    if IMAGE_ONLY_CIMT_RESULTS_PATH.is_file():
         try:
-            image_size = int(metadata["image_size"])
+            with open(IMAGE_ONLY_CIMT_RESULTS_PATH, "r", encoding="utf-8") as f:
+                saved_results = json.load(f)
+        except Exception as error:
+            st.warning(f"Could not read evaluation_results.json: {error}")
+
+    if saved_results:
+        st.markdown("#### 📊 Saved test-set evaluation")
+        metric_cols = st.columns(3)
+        accuracy = saved_results.get("test_accuracy")
+        auc = saved_results.get("test_roc_auc")
+        test_images = saved_results.get("test_images")
+        metric_cols[0].metric(
+            "Test Accuracy",
+            f"{float(accuracy):.2%}" if accuracy is not None else "Not available",
+        )
+        metric_cols[1].metric(
+            "Test ROC-AUC",
+            f"{float(auc):.4f}" if auc is not None else "Not available",
+        )
+        metric_cols[2].metric(
+            "Test Images",
+            str(test_images) if test_images is not None else "Not available",
+        )
+
+    if st.button(
+        "🔍 Run Image-only CIMT Prediction",
+        type="primary",
+        use_container_width=True,
+        key="run_image_only_cimt",
+    ):
+        try:
+            model = load_image_only_cimt_model(
+                str(IMAGE_ONLY_CIMT_MODEL_PATH),
+                IMAGE_ONLY_CIMT_MODEL_PATH.stat().st_mtime,
+            )
+            image_size = 224
+            model_shape = getattr(model, "input_shape", None)
+            if isinstance(model_shape, list):
+                model_shape = model_shape[0]
+            if model_shape and len(model_shape) >= 3:
+                image_size = int(model_shape[1] or 224)
+
             image_array = np.asarray(
                 image.convert("RGB").resize((image_size, image_size)),
                 dtype=np.float32,
-            )
+            ) / 255.0
 
-            preprocessing = metadata.get("image_preprocessing", "rescale_0_1")
-            if preprocessing == "rescale_0_1":
-                image_array /= 255.0
-            elif preprocessing == "efficientnet":
-                image_array = tf.keras.applications.efficientnet.preprocess_input(
-                    image_array
-                )
-            elif preprocessing != "none":
-                raise ValueError(f"Unsupported image preprocessing: {preprocessing}")
-
-            clinical_frame = pd.DataFrame(
-                [[values[f["name"]] for f in clinical_features]],
-                columns=[f["name"] for f in clinical_features],
-            )
-
-            if metadata.get("use_clinical_scaler", False):
-                if not CLINICAL_SCALER_PATH.is_file():
-                    raise FileNotFoundError("Required clinical_scaler.pkl is missing.")
-                scaler = joblib.load(CLINICAL_SCALER_PATH)
-                clinical_array = scaler.transform(clinical_frame)
-            else:
-                clinical_array = clinical_frame.to_numpy(dtype=np.float32)
-
-            image_name = metadata["image_input_name"]
-            clinical_name = metadata["clinical_input_name"]
-            model_names = [
-                tensor.name.split(":")[0].split("/")[-1]
-                for tensor in model.inputs
-            ]
-            if image_name not in model_names or clinical_name not in model_names:
+            output = np.asarray(
+                model.predict(image_array[np.newaxis, ...], verbose=0)
+            ).reshape(-1)
+            output = finite_array(output)
+            if len(output) != 1:
                 raise ValueError(
-                    f"Fusion input names do not match model inputs: {model_names}"
+                    f"Expected one sigmoid output for binary CIMT classification; got {len(output)}."
                 )
 
-            prediction = model.predict(
-                {
-                    image_name: image_array[np.newaxis, ...],
-                    clinical_name: clinical_array.astype(np.float32),
-                },
-                verbose=0,
+            p_class1 = float(np.clip(output[0], 0.0, 1.0))
+            p_class0 = 1.0 - p_class1
+            predicted_class = 1 if p_class1 >= 0.5 else 0
+            class_name = "Thickened CIMT (Class 1)" if predicted_class == 1 else "Normal CIMT (Class 0)"
+            confidence = max(p_class0, p_class1)
+
+            st.markdown("#### 🧾 Prediction result")
+            result_cols = st.columns(2)
+            result_cols[0].metric("Predicted CIMT Class", class_name)
+            result_cols[1].metric("Prediction confidence", f"{confidence:.1%}")
+            st.write(f"**Class 0 probability:** {p_class0:.1%}")
+            st.progress(p_class0)
+            st.write(f"**Class 1 probability:** {p_class1:.1%}")
+            st.progress(p_class1)
+            st.caption(
+                "Research output only. It is not a direct CIMT measurement, "
+                "a heart-disease prediction, or a clinical diagnosis."
             )
-            prediction = np.asarray(prediction).reshape(-1)
-            prediction = finite_array(prediction)
-
-            output_type = metadata.get("output_type", "probabilities")
-            if output_type == "logits":
-                prediction = (
-                    sigmoid(prediction) if len(prediction) == 1
-                    else softmax(prediction)
-                )
-
-            if output_type == "regression":
-                st.session_state.fusion_result = {
-                    "type": "regression",
-                    "score": float(prediction[0]),
-                }
-                st.session_state.fusion_result_key = image_key
-            else:
-                labels = metadata["output_labels"]
-                if len(prediction) != len(labels):
-                    raise ValueError("Output label count does not match model output.")
-                if np.any(prediction < 0) or np.any(prediction > 1):
-                    raise ValueError(
-                        "Output is not a probability. Verify output_type in metadata."
-                    )
-
-                target_index = metadata.get("risk_output_index")
-                if target_index is None:
-                    matches = [
-                        i for i, label in enumerate(labels)
-                        if str(label).lower() in (
-                            "heart disease", "heart_disease", "disease",
-                            "positive", "cad", "heart disease risk",
-                        )
-                    ]
-                    if len(matches) == 1:
-                        target_index = matches[0]
-                    elif len(prediction) == 2:
-                        target_index = int(metadata.get("positive_class_index", 1))
-                    else:
-                        raise ValueError(
-                            "Set risk_output_index in fusion_metadata.json."
-                        )
-
-                target_index = int(target_index)
-                if not 0 <= target_index < len(prediction):
-                    raise ValueError("Invalid risk_output_index.")
-
-                risk_score = float(prediction[target_index])
-                st.session_state.fusion_result = {
-                    "type": "probabilities",
-                    "score": risk_score,
-                    "level": convert_risk_score(risk_score, metadata),
-                    "labels": labels,
-                    "probabilities": prediction.tolist(),
-                }
-                st.session_state.fusion_result_key = image_key
-
         except Exception as error:
             st.error(
-                f"Fusion prediction failed: {type(error).__name__}: {error}"
+                f"Image-only CIMT prediction failed: {type(error).__name__}: {error}"
             )
-
-    result = st.session_state.fusion_result
-    if result is not None and st.session_state.fusion_result_key == image_key:
-        st.markdown("### 📊 Fusion Model Result")
-        if result["type"] == "regression":
-            st.metric("Model Output", f"{result['score']:.4f}")
-            st.warning(
-                "The model output is a regression value. No risk category "
-                "is shown without a justified output mapping."
-            )
-        else:
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Risk Level (research threshold)", result["level"])
-            with col2:
-                st.metric("Model Risk Score", f"{result['score']:.1%}")
-            for label, score in zip(
-                result["labels"], result["probabilities"]
-            ):
-                st.write(f"**{label}:** {score:.1%}")
-                st.progress(float(np.clip(score, 0, 1)))
-        st.warning(
-            "Research prototype only. Low/Medium/High boundaries are not "
-            "clinically validated categories."
-        )
 
 
 # --------------------------- CLINICAL-ONLY MODEL ---------------------------
@@ -572,12 +494,15 @@ def load_cad_artifact(path_string, modified_time):
     }
 
 
-def clinical_only_prediction_section():
+
+def clinical_only_prediction_section(image=None, image_key=None):
     st.divider()
     st.header("❤️ Heart Disease Prediction — Clinical Model")
     st.caption(
-        "This optional model uses clinical data only; it does not use the retinal image."
+        "Clinical-only model. Retinal image predictions are shown separately; "
+        "clinical values must come from verified patient information."
     )
+
     if not CAD_MODEL_PATH.is_file():
         st.info("Clinical-only model not found in the models folder.")
         return
@@ -592,34 +517,86 @@ def clinical_only_prediction_section():
         st.error(f"Could not load clinical model: {error}")
         return
 
+    # Show retinal model estimates when already available.
+    retinal_results = st.session_state.get("retinal_results")
+    if (
+        image_key is not None
+        and st.session_state.get("retinal_result_key") == image_key
+        and retinal_results
+    ):
+        st.subheader("👁️ Image-based estimates")
+        if "Retinal Age" in retinal_results:
+            st.metric(
+                "Estimated Age",
+                f"{float(retinal_results['Retinal Age']):.1f} years",
+            )
+
+        if "Retinal Sex" in retinal_results:
+            sex_result = retinal_results["Retinal Sex"]
+            if isinstance(sex_result, dict) and len(sex_result) == 2:
+                labels = list(sex_result.keys())
+                probabilities = list(sex_result.values())
+                st.metric(
+                    "Estimated Sex",
+                    SEX_CLASS_LABELS[int(np.argmax(probabilities))],
+                )
+                st.caption(
+                    "Check the retinal sex model's training class order."
+                )
+    else:
+        st.info(
+            "Run Retinal Prediction first to display available image-based "
+            "age and sex estimates."
+        )
+
+    st.subheader("Patient Clinical Information")
+    st.info(
+        "Enter verified clinical information below. The retinal image alone "
+        "cannot reliably determine these clinical measurements."
+    )
+
     with st.form("cad_prediction_form"):
-        st.subheader("Patient Clinical Information")
         c1, c2, c3 = st.columns(3)
+
         with c1:
-            age = st.number_input("Age (years)", 1, 120, 45)
+            age = st.number_input("Age (years)", 1, 120, 51)
             sex = st.selectbox(
-                "Sex", [0, 1],
+                "Sex",
+                [0, 1],
+                index=0,
                 format_func=lambda x: "Female" if x == 0 else "Male",
             )
-            cp = st.selectbox("Chest pain type (cp)", [1, 2, 3, 4])
-            trestbps = st.number_input("Resting blood pressure", 50, 250, 120)
+            cp = st.selectbox("Chest pain type (cp)", [1, 2, 3, 4], index=0)
+            trestbps = st.number_input(
+                "Resting blood pressure", 50, 250, 120
+            )
             chol = st.number_input("Cholesterol", 50, 700, 200)
+
         with c2:
             fbs = st.selectbox(
-                "Fasting blood sugar > 120", [0, 1],
+                "Fasting blood sugar > 120",
+                [0, 1],
                 format_func=lambda x: "No" if x == 0 else "Yes",
             )
-            restecg = st.selectbox("Resting ECG", [0, 1, 2])
+            restecg = st.selectbox("Resting ECG", [0, 1, 2], index=0)
             thalach = st.number_input("Maximum heart rate", 40, 250, 150)
             exang = st.selectbox(
-                "Exercise-induced angina", [0, 1],
+                "Exercise-induced angina",
+                [0, 1],
                 format_func=lambda x: "No" if x == 0 else "Yes",
             )
+
         with c3:
-            oldpeak = st.number_input("ST depression (oldpeak)", 0.0, 10.0, 1.0, 0.1)
-            slope = st.selectbox("Slope", [1, 2, 3])
-            ca = st.selectbox("Major vessels (ca)", [0, 1, 2, 3])
-            thal = st.selectbox("Thal", [3, 6, 7])
+            oldpeak = st.number_input(
+                "ST depression (oldpeak)",
+                min_value=0.0,
+                max_value=10.0,
+                value=1.0,
+                step=0.1,
+            )
+            slope = st.selectbox("Slope", [1, 2, 3], index=0)
+            ca = st.selectbox("Major vessels (ca)", [0, 1, 2, 3], index=0)
+            thal = st.selectbox("Thal", [3, 6, 7], index=0)
 
         submitted = st.form_submit_button(
             "Run Clinical Heart Disease Prediction",
@@ -629,14 +606,25 @@ def clinical_only_prediction_section():
 
     if submitted:
         patient = {
-            "age": age, "sex": sex, "cp": cp, "trestbps": trestbps,
-            "chol": chol, "fbs": fbs, "restecg": restecg,
-            "thalach": thalach, "exang": exang, "oldpeak": oldpeak,
-            "slope": slope, "ca": ca, "thal": thal,
+            "age": age,
+            "sex": sex,
+            "cp": cp,
+            "trestbps": trestbps,
+            "chol": chol,
+            "fbs": fbs,
+            "restecg": restecg,
+            "thalach": thalach,
+            "exang": exang,
+            "oldpeak": oldpeak,
+            "slope": slope,
+            "ca": ca,
+            "thal": thal,
         }
+
         try:
             frame = pd.DataFrame([patient]).reindex(columns=features)
             prediction = int(model.predict(frame)[0])
+
             probability = None
             if hasattr(model, "predict_proba"):
                 probabilities = model.predict_proba(frame)[0]
@@ -653,36 +641,55 @@ def clinical_only_prediction_section():
             st.session_state.cad_result = {
                 "prediction": prediction,
                 "probability": probability,
+                "image_key": image_key,
             }
+
         except Exception as error:
-            st.error(f"Clinical prediction failed: {type(error).__name__}: {error}")
+            st.error(
+                f"Clinical prediction failed: "
+                f"{type(error).__name__}: {error}"
+            )
 
     result = st.session_state.cad_result
-    if result is not None:
+    if (
+        result is not None
+        and result.get("image_key") == image_key
+    ):
         if result["prediction"] == 1:
             st.warning("Model output: Disease present")
         else:
             st.success("Model output: No disease detected by the model")
+
         if result["probability"] is not None:
             st.metric(
                 "Positive-class probability",
                 f"{result['probability']:.2%}",
             )
+
         accuracy = artifact.get("test_accuracy")
         auc = artifact.get("test_roc_auc")
         a, b = st.columns(2)
+
         with a:
             st.metric(
                 "Saved test accuracy",
-                f"{float(accuracy) * 100:.2f}%" if accuracy is not None else "Not available",
+                f"{float(accuracy) * 100:.2f}%"
+                if accuracy is not None else "Not available",
             )
+
         with b:
             st.metric(
                 "Saved test ROC-AUC",
-                f"{float(auc):.4f}" if auc is not None else "Not available",
+                f"{float(auc):.4f}"
+                if auc is not None else "Not available",
             )
+
         st.caption(f"Dataset: {artifact.get('dataset', 'Not specified')}")
-        st.warning("Research prototype only; not a diagnosis or validated personal risk estimate.")
+        st.warning(
+            "Research prototype only; not a diagnosis or validated "
+            "personal risk estimate."
+        )
+
 
 
 # --------------------------- GRAD-CAM ---------------------------
@@ -767,14 +774,21 @@ def show_gradcam(image):
             heat[..., 2] = 1 - cam
             overlay = np.clip(0.55 * base + 0.45 * heat, 0, 1)
             overlay_image = Image.fromarray((overlay * 255).astype(np.uint8))
+       
             c1, c2 = st.columns(2)
+
             with c1:
-                st.image(image, caption="Original retinal image", use_container_width=True)
+                st.image(
+                    image.convert("RGB"),
+                    caption="Original retinal image",
+                    width=450,
+                )
+
             with c2:
                 st.image(
-                    overlay_image,
+                    overlay_image.convert("RGB"),
                     caption=f"Grad-CAM — class index {class_index}",
-                    use_container_width=True,
+                    width=450,
                 )
         except Exception as error:
             st.error(f"Grad-CAM failed: {type(error).__name__}: {error}")
@@ -796,9 +810,8 @@ for name, (filename, task) in MODEL_FILES.items():
 
 st.sidebar.subheader("Prediction Models")
 for name, path in [
-    ("Fusion Model", FUSION_MODEL_PATH),
-    ("Fusion Metadata", FUSION_METADATA_PATH),
-    ("Clinical Scaler", CLINICAL_SCALER_PATH),
+    ("Image-only CIMT Model", IMAGE_ONLY_CIMT_MODEL_PATH),
+    ("CIMT Evaluation Results", IMAGE_ONLY_CIMT_RESULTS_PATH),
     ("Clinical CAD Model", CAD_MODEL_PATH),
 ]:
     if path.is_file():
@@ -806,67 +819,112 @@ for name, path in [
     else:
         st.sidebar.info(f"{name}: Missing")
 
+
 # --------------------------- MAIN DASHBOARD ---------------------------
+
+import io
+import hashlib
+from PIL import Image, ImageOps
 
 st.title("👁️ Retina AI Research Dashboard")
 st.caption(
-    "Upload a retinal image once, then run retinal analysis and heart-disease "
-    "prediction separately."
+    "Upload a retinal image once, then run retinal analysis and "
+    "heart-disease prediction separately."
 )
-st.warning("Research prototype only. Not validated for clinical diagnosis.")
+st.warning(
+    "Research prototype only. Not validated for clinical diagnosis."
+)
+
+# --------------------------- IMAGE UPLOAD ---------------------------
 
 upload_col, camera_col = st.columns(2)
+
 with upload_col:
     st.subheader("🖼️ Upload Retinal Image")
     uploaded_file = st.file_uploader(
-        "Choose image",
+        "Choose retinal image",
         type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
         key="retina_upload",
     )
+
 with camera_col:
     st.subheader("📷 Capture Retinal Image")
-    camera_photo = st.camera_input("Capture fundus image", key="retina_camera")
+    camera_photo = st.camera_input(
+        "Capture fundus image",
+        key="retina_camera",
+    )
+
+# --------------------------- LOAD IMAGE ---------------------------
 
 image = None
 image_key = None
 
-try:
-    selected = uploaded_file if uploaded_file is not None else camera_photo
-    if selected is not None:
-        raw = selected.getvalue()
+selected = uploaded_file if uploaded_file is not None else camera_photo
+
+if selected is not None:
+    try:
+        raw_image_bytes = selected.getvalue()
+        image_key = hashlib.sha256(raw_image_bytes).hexdigest()
+
         image = ImageOps.exif_transpose(
-            Image.open(io.BytesIO(raw))
-        ).convert("RGB").copy()
-        image_key = hash_bytes(raw)
-except Exception as error:
-    st.error(f"Could not open image: {type(error).__name__}: {error}")
+            Image.open(io.BytesIO(raw_image_bytes))
+        ).convert("RGB")
+
+    except Exception as error:
+        st.error(
+            f"Could not open image: {type(error).__name__}: {error}"
+        )
+
+# --------------------------- SESSION STATE ---------------------------
+
+default_states = {
+    "selected_image_key": None,
+    "retinal_results": None,
+    "retinal_result_key": None,
+    "cad_result": None,
+}
+
+for state_name, default_value in default_states.items():
+    if state_name not in st.session_state:
+        st.session_state[state_name] = default_value
 
 if image_key != st.session_state.selected_image_key:
     st.session_state.selected_image_key = image_key
     st.session_state.retinal_results = None
     st.session_state.retinal_result_key = None
-    st.session_state.fusion_result = None
-    st.session_state.fusion_result_key = None
     st.session_state.cad_result = None
+
+# --------------------------- IMAGE PREVIEW ---------------------------
 
 if image is not None:
     st.divider()
     st.subheader("📷 Selected Retinal Image")
+
     preview_col, details_col = st.columns([1, 1])
 
     with preview_col:
-        # Direct PIL display: no HTML img tags or local paths.
+        st.markdown("### Uploaded Retinal Image")
         st.image(
             image,
             caption="Uploaded Retinal / Fundus Image",
             use_container_width=True,
         )
+
     with details_col:
         st.markdown("### Image Information")
         st.write(f"**Width:** {image.width} px")
         st.write(f"**Height:** {image.height} px")
-        st.write(f"**Format:** RGB")
-        st.write(f"**Device:** {DEVICE}")
+        st.write("**Format:** RGB")
+        st.write(f"**Image mode:** {image.mode}")
+
+
+# --------------------------- REST OF YOUR DASHBOARD ---------------------------
+# Keep retinal analysis, clinical prediction, Grad-CAM and other dashboard code.
+
+# --------------------------------------------------
+# DASHBOARD CONTINUES BELOW
+# --------------------------------------------------
+
 
     st.divider()
     st.header("Choose Prediction")
@@ -883,7 +941,7 @@ if image is not None:
 
     with heart_col:
         st.markdown("### ❤️ Heart Disease Risk")
-        st.caption("Run the image-plus-clinical Fusion Model below.")
+        st.caption("Clinical heart-disease model remains a separate section below.")
 
     if run_retinal:
         results = {}
@@ -908,22 +966,19 @@ if image is not None:
     ):
         show_retinal_results(st.session_state.retinal_results)
 
-    # Fusion model section remains separate from retinal predictions.
-    fusion_prediction_section(image, image_key)
-
-    # Optional saved clinical-only model is clearly identified as separate.
-    with st.expander("Optional: Clinical-only Heart Disease Model", expanded=False):
-        clinical_only_prediction_section()
+    # Newly trained Keras image-only CIMT model is shown separately.
+    image_only_cimt_prediction_section(image)
 
     show_gradcam(image)
 
 else:
     st.info(
-        "Upload or capture a retinal image. The preview and prediction options "
-        "will appear after an image is selected."
+        "Upload or capture a retinal image to run retinal analysis and the new image-only CIMT model. "
+        "The clinical-only Heart Disease Model below works without an image."
     )
-    st.subheader("❤️ Heart Disease Prediction — Fusion Model")
-    st.info("Upload a retinal image to run the image-plus-clinical fusion model.")
+
+# Clinical-only model is available whether or not a retinal image was uploaded.
+clinical_only_prediction_section()
 
 st.divider()
 st.caption(
