@@ -59,6 +59,7 @@ MODEL_FILES = {
     "Retinal Sex": ("retina_sex_model_v2.pth", "classification"),
     "Retinal Disease": ("retina_disease_model.pth", "multilabel"),
     "CIMT Estimate": ("cimt_thickness_model.pth", "regression"),
+    "CIMT Classification (ResNet-18)": ("cimt_any_eye_resnet18_v1.pth", "cimt_binary"),
 }
 DISEASE_LABELS = [
     "Normal", "Diabetes", "Glaucoma", "Cataract",
@@ -183,25 +184,38 @@ def load_retinal_model(path_string, task, modified_time):
     else:
         state = clean_state_dict(extract_state_dict(checkpoint))
 
-        # This reconstruction assumes EfficientNet-B0 was used in training.
-        if task == "multilabel":
-            output_size = len(DISEASE_LABELS)
-        elif task == "classification":
-            weight = state.get("classifier.1.weight")
-            if weight is None:
+        # CIMT classifier: ImageNet-pretrained ResNet-18 architecture.
+        if task == "cimt_binary":
+            fc_weight = state.get("fc.weight")
+            if fc_weight is None:
                 raise ValueError(
-                    "Cannot infer classifier size from this checkpoint. "
-                    "Use the original model architecture from training."
+                    "CIMT checkpoint does not contain ResNet-18 fc.weight. "
+                    "The original training architecture/key names must match."
                 )
-            output_size = int(weight.shape[0])
+            output_size = int(fc_weight.shape[0])
+            model = models.resnet18(weights=None)
+            model.fc = nn.Linear(model.fc.in_features, output_size)
+            model.load_state_dict(state, strict=True)
         else:
-            output_size = 1
+            # Existing retinal models in this app assume EfficientNet-B0.
+            if task == "multilabel":
+                output_size = len(DISEASE_LABELS)
+            elif task == "classification":
+                weight = state.get("classifier.1.weight")
+                if weight is None:
+                    raise ValueError(
+                        "Cannot infer classifier size from this checkpoint. "
+                        "Use the original model architecture from training."
+                    )
+                output_size = int(weight.shape[0])
+            else:
+                output_size = 1
 
-        model = models.efficientnet_b0(weights=None)
-        model.classifier[1] = nn.Linear(
-            model.classifier[1].in_features, output_size
-        )
-        model.load_state_dict(state, strict=True)
+            model = models.efficientnet_b0(weights=None)
+            model.classifier[1] = nn.Linear(
+                model.classifier[1].in_features, output_size
+            )
+            model.load_state_dict(state, strict=True)
 
     model = model.to(DEVICE).eval()
     return model
@@ -217,6 +231,23 @@ def retinal_predict(model, image, task):
 
     if task == "regression":
         return float(values[0])
+
+    if task == "cimt_binary":
+        if len(values) == 1:
+            positive = float(sigmoid(values)[0])
+            return {
+                "Normal CIMT": 1.0 - positive,
+                "Thickened CIMT": positive,
+            }
+        probabilities = softmax(values)
+        if len(probabilities) != 2:
+            raise ValueError(
+                f"CIMT model expected 1 or 2 outputs, got {len(probabilities)}."
+            )
+        return {
+            "Normal CIMT": float(probabilities[0]),
+            "Thickened CIMT": float(probabilities[1]),
+        }
 
     if task == "multilabel":
         # Verify whether the training code used sigmoid logits or probabilities.
@@ -318,6 +349,23 @@ def show_retinal_results(results):
                     show_disease_results(result)
                 elif name == "CIMT Estimate":
                     show_cimt_result(result)
+                elif name == "CIMT Classification (ResNet-18)":
+                    if not isinstance(result, dict) or len(result) != 2:
+                        st.error("CIMT classifier returned an unexpected output.")
+                    else:
+                        predicted_label = max(result, key=result.get)
+                        st.metric("CIMT Class", predicted_label)
+                        st.metric("Prediction score", f"{result[predicted_label]:.1%}")
+                        st.write("Class probabilities")
+                        for label in ("Normal CIMT", "Thickened CIMT"):
+                            score = float(result[label])
+                            st.write(f"**{label}:** {score:.1%}")
+                            st.progress(float(np.clip(score, 0, 1)))
+                        st.caption(
+                            "Held-out test results from training: Accuracy 76.00%, "
+                            "Sensitivity 92.00%, Specificity 60.00%, ROC-AUC 0.8290. "
+                            "Research result only; not a clinical diagnosis."
+                        )
 
 
 # --------------------------- FUSION MODEL ---------------------------
