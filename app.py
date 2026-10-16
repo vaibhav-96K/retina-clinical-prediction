@@ -810,7 +810,7 @@ for name, (filename, task) in MODEL_FILES.items():
 st.sidebar.subheader("Prediction Models")
 for name, path in [
     ("Image-only CIMT Model", IMAGE_ONLY_CIMT_MODEL_PATH),
-    ("CIMT Evaluation Results", IMAGE_ONLY_CIMT_RESULTS_PATH),,
+  ("CIMT Evaluation Results", IMAGE_ONLY_CIMT_EVALUATION_PATH),
     ("Clinical CAD Model", CAD_MODEL_PATH),
 ]:
     if path.is_file():
