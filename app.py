@@ -366,122 +366,113 @@ def show_retinal_results(results):
                     show_cimt_result(result)
 
 
-# --------------------------- KERAS RETINAL AGE + DR MODEL ---------------------------
+# --------------------------- IMAGE-ONLY CIMT MODEL ---------------------------
 
-RETINA_AGE_DR_MODEL_PATH = MODEL_DIR / "retina_age_dr_model.keras"
+IMAGE_ONLY_CIMT_MODEL_PATH = MODEL_DIR / "best_image_only_cimt.keras"
 IMAGE_ONLY_CIMT_RESULTS_PATH = MODEL_DIR / "evaluation_results.json"
 
 
 @st.cache_resource(show_spinner=False)
-def load_retina_age_dr_model(path_string, modified_time):
+def load_image_only_cimt_model(path_string, modified_time):
     return tf.keras.models.load_model(path_string, compile=False)
 
 
-def _flatten_model_output(value):
-    arr = np.asarray(value, dtype=np.float64).reshape(-1)
-    return finite_array(arr)
-
-
-def retina_age_dr_prediction_section(image):
+def image_only_cimt_prediction_section(image):
     st.divider()
-    st.header("🧠 Retinal Age & Diabetic Retinopathy (DR) Model")
+    st.header("🩺 Retinal Image-only CIMT Classification")
     st.caption(
-        "Uses retina_age_dr_model.keras to show its age and DR outputs. "
-        "Research predictions only; not a medical diagnosis."
+        "Uses the newly trained retinal image model. This predicts CIMT class, "
+        "not heart disease directly and not a measured CIMT thickness."
     )
 
-    if not RETINA_AGE_DR_MODEL_PATH.is_file():
-        st.info(
-            f"Age + DR model not found: `{RETINA_AGE_DR_MODEL_PATH}`. "
-            "Place retina_age_dr_model.keras inside the app's models folder."
+    if not IMAGE_ONLY_CIMT_MODEL_PATH.is_file():
+        st.warning(
+            f"Model file not found: `{IMAGE_ONLY_CIMT_MODEL_PATH}`. "
+            "Upload best_image_only_cimt.keras into the app's models folder."
         )
         return
 
+    saved_results = {}
+    if IMAGE_ONLY_CIMT_RESULTS_PATH.is_file():
+        try:
+            with open(IMAGE_ONLY_CIMT_RESULTS_PATH, "r", encoding="utf-8") as f:
+                saved_results = json.load(f)
+        except Exception as error:
+            st.warning(f"Could not read evaluation_results.json: {error}")
+
+    if saved_results:
+        st.markdown("#### 📊 Saved test-set evaluation")
+        metric_cols = st.columns(3)
+        accuracy = saved_results.get("test_accuracy")
+        auc = saved_results.get("test_roc_auc")
+        test_images = saved_results.get("test_images")
+        metric_cols[0].metric(
+            "Test Accuracy",
+            f"{float(accuracy):.2%}" if accuracy is not None else "Not available",
+        )
+        metric_cols[1].metric(
+            "Test ROC-AUC",
+            f"{float(auc):.4f}" if auc is not None else "Not available",
+        )
+        metric_cols[2].metric(
+            "Test Images",
+            str(test_images) if test_images is not None else "Not available",
+        )
+
     if st.button(
-        "🔍 Run Retinal Age + DR Prediction",
+        "🔍 Run Image-only CIMT Prediction",
         type="primary",
         use_container_width=True,
-        key="run_retina_age_dr",
+        key="run_image_only_cimt",
     ):
         try:
-            model = load_retina_age_dr_model(
-                str(RETINA_AGE_DR_MODEL_PATH),
-                RETINA_AGE_DR_MODEL_PATH.stat().st_mtime,
+            model = load_image_only_cimt_model(
+                str(IMAGE_ONLY_CIMT_MODEL_PATH),
+                IMAGE_ONLY_CIMT_MODEL_PATH.stat().st_mtime,
             )
-            input_shape = getattr(model, "input_shape", None)
-            if isinstance(input_shape, list):
-                input_shape = input_shape[0]
             image_size = 224
-            if input_shape and len(input_shape) >= 3:
-                image_size = int(input_shape[1] or 224)
+            model_shape = getattr(model, "input_shape", None)
+            if isinstance(model_shape, list):
+                model_shape = model_shape[0]
+            if model_shape and len(model_shape) >= 3:
+                image_size = int(model_shape[1] or 224)
+
             image_array = np.asarray(
                 image.convert("RGB").resize((image_size, image_size)),
                 dtype=np.float32,
             ) / 255.0
-            raw = model.predict(image_array[np.newaxis, ...], verbose=0)
 
-            # Support named dict outputs and standard multi-output Keras models.
-            if isinstance(raw, dict):
-                outputs = {str(k).lower(): _flatten_model_output(v) for k, v in raw.items()}
-            elif isinstance(raw, (list, tuple)):
-                names = list(getattr(model, "output_names", []) or [])
-                outputs = {
-                    (str(names[i]).lower() if i < len(names) else f"output_{i}"): _flatten_model_output(v)
-                    for i, v in enumerate(raw)
-                }
-            else:
-                arr = np.asarray(raw)
-                if arr.ndim == 2 and arr.shape[1] >= 2:
-                    outputs = {"output_0": _flatten_model_output(arr[0, :1]),
-                               "output_1": _flatten_model_output(arr[0, 1:])}
-                else:
-                    outputs = {str((getattr(model, "output_names", ["output_0"] or ["output_0"])[0])).lower(): _flatten_model_output(arr)}
-
-            age_key = next((k for k in outputs if "age" in k), None)
-            dr_key = next((k for k in outputs if any(term in k for term in ("dr", "diabet", "retinopath"))), None)
-            # If output names are generic, use the conventional two-output order: age, then DR.
-            if age_key is None and len(outputs) >= 2:
-                age_key = list(outputs.keys())[0]
-            if dr_key is None and len(outputs) >= 2:
-                dr_key = next((k for k in outputs if k != age_key), None)
-
-            if age_key is None or dr_key is None:
+            output = np.asarray(
+                model.predict(image_array[np.newaxis, ...], verbose=0)
+            ).reshape(-1)
+            output = finite_array(output)
+            if len(output) != 1:
                 raise ValueError(
-                    "Could not identify both Age and DR outputs. Model output names are: "
-                    + ", ".join(outputs.keys())
-                    + ". Please confirm the model's output order/names."
+                    f"Expected one sigmoid output for binary CIMT classification; got {len(output)}."
                 )
 
-            age_value = float(outputs[age_key][0])
-            dr_values = outputs[dr_key]
-            if len(dr_values) == 1:
-                raw_score = float(dr_values[0])
-                dr_probability = raw_score if 0.0 <= raw_score <= 1.0 else float(sigmoid([raw_score])[0])
-                dr_label = "DR Positive" if dr_probability >= 0.5 else "DR Negative"
-                dr_confidence = max(dr_probability, 1.0 - dr_probability)
-                dr_details = [("DR Negative", 1.0 - dr_probability), ("DR Positive", dr_probability)]
-            else:
-                dr_probabilities = dr_values.astype(float)
-                if np.any(dr_probabilities < 0) or np.any(dr_probabilities > 1) or not np.isclose(dr_probabilities.sum(), 1.0, atol=0.05):
-                    dr_probabilities = softmax(dr_probabilities)
-                idx = int(np.argmax(dr_probabilities))
-                dr_label = f"DR class {idx}"
-                dr_confidence = float(dr_probabilities[idx])
-                dr_details = [(f"DR class {i}", float(v)) for i, v in enumerate(dr_probabilities)]
+            p_class1 = float(np.clip(output[0], 0.0, 1.0))
+            p_class0 = 1.0 - p_class1
+            predicted_class = 1 if p_class1 >= 0.5 else 0
+            class_name = "Thickened CIMT (Class 1)" if predicted_class == 1 else "Normal CIMT (Class 0)"
+            confidence = max(p_class0, p_class1)
 
-            st.markdown("#### 🧾 Prediction Results")
-            c1, c2 = st.columns(2)
-            c1.metric("Estimated Retinal Age", f"{age_value:.1f} years")
-            c2.metric("Diabetic Retinopathy Output", dr_label, f"Confidence: {dr_confidence:.1%}")
-            for label, probability in dr_details:
-                st.write(f"**{label}:** {probability:.1%}")
-                st.progress(float(np.clip(probability, 0.0, 1.0)))
+            st.markdown("#### 🧾 Prediction result")
+            result_cols = st.columns(2)
+            result_cols[0].metric("Predicted CIMT Class", class_name)
+            result_cols[1].metric("Prediction confidence", f"{confidence:.1%}")
+            st.write(f"**Class 0 probability:** {p_class0:.1%}")
+            st.progress(p_class0)
+            st.write(f"**Class 1 probability:** {p_class1:.1%}")
+            st.progress(p_class1)
             st.caption(
-                "The model's training-time output order, preprocessing, age units, "
-                "and DR label mapping should be verified before interpreting results."
+                "Research output only. It is not a direct CIMT measurement, "
+                "a heart-disease prediction, or a clinical diagnosis."
             )
         except Exception as error:
-            st.error(f"Age + DR prediction failed: {type(error).__name__}: {error}")
+            st.error(
+                f"Image-only CIMT prediction failed: {type(error).__name__}: {error}"
+            )
 
 
 # --------------------------- CLINICAL-ONLY MODEL ---------------------------
@@ -819,7 +810,8 @@ for name, (filename, task) in MODEL_FILES.items():
 
 st.sidebar.subheader("Prediction Models")
 for name, path in [
-    ("Retinal Age + DR Model", RETINA_AGE_DR_MODEL_PATH),
+    ("Image-only CIMT Model", IMAGE_ONLY_CIMT_MODEL_PATH),
+    ("CIMT Evaluation Results", IMAGE_ONLY_CIMT_RESULTS_PATH),
     ("Clinical CAD Model", CAD_MODEL_PATH),
 ]:
     if path.is_file():
@@ -974,14 +966,14 @@ if image is not None:
     ):
         show_retinal_results(st.session_state.retinal_results)
 
-    # Keras model supplies both retinal age and DR outputs.
-    retina_age_dr_prediction_section(image)
+    # Newly trained Keras image-only CIMT model is shown separately.
+    image_only_cimt_prediction_section(image)
 
     show_gradcam(image)
 
 else:
     st.info(
-        "Upload or capture a retinal image to run retinal analysis and the Age + DR model. "
+        "Upload or capture a retinal image to run retinal analysis and the new image-only CIMT model. "
         "The clinical-only Heart Disease Model below works without an image."
     )
 
