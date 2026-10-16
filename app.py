@@ -59,7 +59,6 @@ MODEL_FILES = {
     "Retinal Sex": ("retina_sex_model_v2.pth", "classification"),
     "Retinal Disease": ("retina_disease_model.pth", "multilabel"),
     "CIMT Estimate": ("cimt_thickness_model.pth", "regression"),
-    "CIMT Classification (ResNet-18)": ("cimt_any_eye_resnet18_v1.pth", "cimt_binary"),
 }
 DISEASE_LABELS = [
     "Normal", "Diabetes", "Glaucoma", "Cataract",
@@ -97,6 +96,8 @@ DEFAULTS = {
     "fusion_result": None,
     "fusion_result_key": None,
     "cad_result": None,
+    "cimt_resnet_result": None,
+    "cimt_resnet_result_key": None,
 }
 for key, default in DEFAULTS.items():
     if key not in st.session_state:
@@ -184,38 +185,25 @@ def load_retinal_model(path_string, task, modified_time):
     else:
         state = clean_state_dict(extract_state_dict(checkpoint))
 
-        # CIMT classifier: ImageNet-pretrained ResNet-18 architecture.
-        if task == "cimt_binary":
-            fc_weight = state.get("fc.weight")
-            if fc_weight is None:
+        # This reconstruction assumes EfficientNet-B0 was used in training.
+        if task == "multilabel":
+            output_size = len(DISEASE_LABELS)
+        elif task == "classification":
+            weight = state.get("classifier.1.weight")
+            if weight is None:
                 raise ValueError(
-                    "CIMT checkpoint does not contain ResNet-18 fc.weight. "
-                    "The original training architecture/key names must match."
+                    "Cannot infer classifier size from this checkpoint. "
+                    "Use the original model architecture from training."
                 )
-            output_size = int(fc_weight.shape[0])
-            model = models.resnet18(weights=None)
-            model.fc = nn.Linear(model.fc.in_features, output_size)
-            model.load_state_dict(state, strict=True)
+            output_size = int(weight.shape[0])
         else:
-            # Existing retinal models in this app assume EfficientNet-B0.
-            if task == "multilabel":
-                output_size = len(DISEASE_LABELS)
-            elif task == "classification":
-                weight = state.get("classifier.1.weight")
-                if weight is None:
-                    raise ValueError(
-                        "Cannot infer classifier size from this checkpoint. "
-                        "Use the original model architecture from training."
-                    )
-                output_size = int(weight.shape[0])
-            else:
-                output_size = 1
+            output_size = 1
 
-            model = models.efficientnet_b0(weights=None)
-            model.classifier[1] = nn.Linear(
-                model.classifier[1].in_features, output_size
-            )
-            model.load_state_dict(state, strict=True)
+        model = models.efficientnet_b0(weights=None)
+        model.classifier[1] = nn.Linear(
+            model.classifier[1].in_features, output_size
+        )
+        model.load_state_dict(state, strict=True)
 
     model = model.to(DEVICE).eval()
     return model
@@ -231,23 +219,6 @@ def retinal_predict(model, image, task):
 
     if task == "regression":
         return float(values[0])
-
-    if task == "cimt_binary":
-        if len(values) == 1:
-            positive = float(sigmoid(values)[0])
-            return {
-                "Normal CIMT": 1.0 - positive,
-                "Thickened CIMT": positive,
-            }
-        probabilities = softmax(values)
-        if len(probabilities) != 2:
-            raise ValueError(
-                f"CIMT model expected 1 or 2 outputs, got {len(probabilities)}."
-            )
-        return {
-            "Normal CIMT": float(probabilities[0]),
-            "Thickened CIMT": float(probabilities[1]),
-        }
 
     if task == "multilabel":
         # Verify whether the training code used sigmoid logits or probabilities.
@@ -349,23 +320,117 @@ def show_retinal_results(results):
                     show_disease_results(result)
                 elif name == "CIMT Estimate":
                     show_cimt_result(result)
-                elif name == "CIMT Classification (ResNet-18)":
-                    if not isinstance(result, dict) or len(result) != 2:
-                        st.error("CIMT classifier returned an unexpected output.")
-                    else:
-                        predicted_label = max(result, key=result.get)
-                        st.metric("CIMT Class", predicted_label)
-                        st.metric("Prediction score", f"{result[predicted_label]:.1%}")
-                        st.write("Class probabilities")
-                        for label in ("Normal CIMT", "Thickened CIMT"):
-                            score = float(result[label])
-                            st.write(f"**{label}:** {score:.1%}")
-                            st.progress(float(np.clip(score, 0, 1)))
-                        st.caption(
-                            "Held-out test results from training: Accuracy 76.00%, "
-                            "Sensitivity 92.00%, Specificity 60.00%, ROC-AUC 0.8290. "
-                            "Research result only; not a clinical diagnosis."
-                        )
+
+
+
+# --------------------------- TRAINED CIMT RESNET-18 MODEL ---------------------------
+
+CIMT_RESNET_PATH = MODEL_DIR / "cimt_any_eye_resnet18_v1.pth"
+CIMT_CLASS_LABELS = ["Normal CIMT", "Thickened CIMT"]
+
+@st.cache_resource(show_spinner=False)
+def load_cimt_resnet18(path_string, modified_time):
+    """Load the saved ResNet-18 CIMT classifier trained in the project notebook."""
+    path = Path(path_string)
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing trained CIMT model: {path}")
+
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location="cpu")
+
+    if isinstance(checkpoint, nn.Module):
+        model = checkpoint
+    else:
+        state = clean_state_dict(extract_state_dict(checkpoint))
+        fc_weight = state.get("fc.weight")
+        if fc_weight is None:
+            raise ValueError(
+                "This checkpoint does not contain 'fc.weight'. "
+                "The training model's ResNet-18 classifier architecture is needed."
+            )
+        output_size = int(fc_weight.shape[0])
+        model = models.resnet18(weights=None)
+        model.fc = nn.Linear(model.fc.in_features, output_size)
+        model.load_state_dict(state, strict=True)
+
+    model = model.to(DEVICE).eval()
+    return model
+
+
+def predict_cimt_resnet18(model, image):
+    """Predict Normal CIMT vs Thickened CIMT using ImageNet normalization."""
+    tensor = TRANSFORM(image.convert("RGB")).unsqueeze(0).to(DEVICE)
+    with torch.inference_mode():
+        output = get_output(model(tensor))
+    values = finite_array(output.detach().float().cpu().numpy().reshape(-1))
+
+    if len(values) == 1:
+        positive_probability = float(sigmoid(values)[0])
+        probabilities = np.array([1.0 - positive_probability, positive_probability])
+    elif len(values) == 2:
+        probabilities = softmax(values)
+    else:
+        raise ValueError(
+            f"Expected 1 or 2 classifier outputs, received {len(values)}."
+        )
+
+    class_index = int(np.argmax(probabilities))
+    return {
+        "label": CIMT_CLASS_LABELS[class_index],
+        "confidence": float(probabilities[class_index]),
+        "normal_probability": float(probabilities[0]),
+        "thickened_probability": float(probabilities[1]),
+    }
+
+
+def show_cimt_resnet18_section(image, image_key):
+    st.divider()
+    st.header("🩺 CIMT Classification — Trained ResNet-18")
+    st.caption(
+        "Uses the saved CIMT classifier. This predicts Normal vs Thickened CIMT; "
+        "it is not a direct heart-disease diagnosis."
+    )
+
+    if not CIMT_RESNET_PATH.is_file():
+        st.warning(f"Trained CIMT model not found: `{CIMT_RESNET_PATH}`")
+        return
+
+    if st.button(
+        "🩺 Run CIMT Prediction",
+        type="primary",
+        use_container_width=True,
+        key="run_cimt_resnet18",
+    ):
+        try:
+            with st.spinner("Loading trained ResNet-18 and analyzing image..."):
+                model = load_cimt_resnet18(
+                    str(CIMT_RESNET_PATH), CIMT_RESNET_PATH.stat().st_mtime
+                )
+                result = predict_cimt_resnet18(model, image)
+            st.session_state["cimt_resnet_result"] = result
+            st.session_state["cimt_resnet_result_key"] = image_key
+        except Exception as error:
+            st.error(f"CIMT prediction failed: {type(error).__name__}: {error}")
+
+    result = st.session_state.get("cimt_resnet_result")
+    result_key = st.session_state.get("cimt_resnet_result_key")
+    if result is not None and result_key == image_key:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("Predicted CIMT Class", result["label"])
+        with c2:
+            st.metric("Prediction Confidence", f'{result["confidence"]:.1%}')
+        st.write(f'**Normal CIMT probability:** {result["normal_probability"]:.1%}')
+        st.progress(float(np.clip(result["normal_probability"], 0, 1)))
+        st.write(f'**Thickened CIMT probability:** {result["thickened_probability"]:.1%}')
+        st.progress(float(np.clip(result["thickened_probability"], 0, 1)))
+        st.caption(
+            "Held-out test results from training: accuracy 76.00%, "
+            "sensitivity 92.00%, specificity 60.00%, ROC-AUC 0.8290. "
+            "Research use only; not clinically validated."
+        )
 
 
 # --------------------------- FUSION MODEL ---------------------------
@@ -1026,6 +1091,8 @@ if image_key != st.session_state.selected_image_key:
     st.session_state.fusion_result = None
     st.session_state.fusion_result_key = None
     st.session_state.cad_result = None
+    st.session_state.cimt_resnet_result = None
+    st.session_state.cimt_resnet_result_key = None
 
 # --------------------------- IMAGE PREVIEW ---------------------------
 
@@ -1099,6 +1166,9 @@ if image is not None:
         and st.session_state.retinal_result_key == image_key
     ):
         show_retinal_results(st.session_state.retinal_results)
+
+    # Trained ResNet-18 CIMT classifier is separate from the other retinal models.
+    show_cimt_resnet18_section(image, image_key)
 
     # Fusion model section remains separate from retinal predictions.
     fusion_prediction_section(image, image_key)
