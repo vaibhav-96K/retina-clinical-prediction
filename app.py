@@ -366,112 +366,82 @@ def show_retinal_results(results):
                     show_cimt_result(result)
 
 
-# --------------------------- IMAGE-ONLY CIMT MODEL ---------------------------
+# --------------------------- RETINA AGE / DR KERAS MODEL ---------------------------
 
 RETINA_AGE_DR_MODEL_PATH = MODEL_DIR / "retina_age_dr_model.keras"
-("Retina Age/DR Model", RETINA_AGE_DR_MODEL_PATH),
 
 
 @st.cache_resource(show_spinner=False)
-def load_image_only_cimt_model(path_string, modified_time):
+def load_retina_age_dr_model(path_string, modified_time):
     return tf.keras.models.load_model(path_string, compile=False)
 
 
-def image_only_cimt_prediction_section(image):
+def retina_age_dr_prediction_section(image):
     st.divider()
-    st.header("🩺 Retinal Image-only CIMT Classification")
+    st.header("👁️ Retina Age / DR Model")
     st.caption(
-        "Uses the newly trained retinal image model. This predicts CIMT class, "
-        "not heart disease directly and not a measured CIMT thickness."
+        "Runs the saved retina_age_dr_model.keras model on the uploaded retinal image. "
+        "The raw model output is shown without guessing its class meanings; confirm "
+        "the output labels and preprocessing from the model's training code."
     )
 
-    if not IMAGE_ONLY_CIMT_MODEL_PATH.is_file():
+    if not RETINA_AGE_DR_MODEL_PATH.is_file():
         st.warning(
-            f"Model file not found: `{IMAGE_ONLY_CIMT_MODEL_PATH}`. "
-            "Upload best_image_only_cimt.keras into the app's models folder."
+            f"Model file not found: `{RETINA_AGE_DR_MODEL_PATH}`. "
+            "Add retina_age_dr_model.keras to the app's models folder."
         )
         return
 
-    saved_results = {}
-    if IMAGE_ONLY_CIMT_RESULTS_PATH.is_file():
-        try:
-            with open(IMAGE_ONLY_CIMT_RESULTS_PATH, "r", encoding="utf-8") as f:
-                saved_results = json.load(f)
-        except Exception as error:
-            st.warning(f"Could not read evaluation_results.json: {error}")
-
-    if saved_results:
-        st.markdown("#### 📊 Saved test-set evaluation")
-        metric_cols = st.columns(3)
-        accuracy = saved_results.get("test_accuracy")
-        auc = saved_results.get("test_roc_auc")
-        test_images = saved_results.get("test_images")
-        metric_cols[0].metric(
-            "Test Accuracy",
-            f"{float(accuracy):.2%}" if accuracy is not None else "Not available",
-        )
-        metric_cols[1].metric(
-            "Test ROC-AUC",
-            f"{float(auc):.4f}" if auc is not None else "Not available",
-        )
-        metric_cols[2].metric(
-            "Test Images",
-            str(test_images) if test_images is not None else "Not available",
-        )
-
     if st.button(
-        "🔍 Run Image-only CIMT Prediction",
+        "🔍 Run Retina Age / DR Model",
         type="primary",
         use_container_width=True,
-        key="run_image_only_cimt",
+        key="run_retina_age_dr_model",
     ):
         try:
-            model = load_image_only_cimt_model(
-                str(IMAGE_ONLY_CIMT_MODEL_PATH),
-                IMAGE_ONLY_CIMT_MODEL_PATH.stat().st_mtime,
+            model = load_retina_age_dr_model(
+                str(RETINA_AGE_DR_MODEL_PATH),
+                RETINA_AGE_DR_MODEL_PATH.stat().st_mtime,
             )
-            image_size = 224
+
             model_shape = getattr(model, "input_shape", None)
             if isinstance(model_shape, list):
                 model_shape = model_shape[0]
-            if model_shape and len(model_shape) >= 3:
-                image_size = int(model_shape[1] or 224)
+            image_height = int(model_shape[1]) if model_shape and len(model_shape) > 2 and model_shape[1] else 224
+            image_width = int(model_shape[2]) if model_shape and len(model_shape) > 2 and model_shape[2] else 224
 
             image_array = np.asarray(
-                image.convert("RGB").resize((image_size, image_size)),
+                image.convert("RGB").resize((image_width, image_height)),
                 dtype=np.float32,
             ) / 255.0
 
             output = np.asarray(
                 model.predict(image_array[np.newaxis, ...], verbose=0)
-            ).reshape(-1)
-            output = finite_array(output)
-            if len(output) != 1:
-                raise ValueError(
-                    f"Expected one sigmoid output for binary CIMT classification; got {len(output)}."
-                )
+            )
+            output = finite_array(output).reshape(-1)
 
-            p_class1 = float(np.clip(output[0], 0.0, 1.0))
-            p_class0 = 1.0 - p_class1
-            predicted_class = 1 if p_class1 >= 0.5 else 0
-            class_name = "Thickened CIMT (Class 1)" if predicted_class == 1 else "Normal CIMT (Class 0)"
-            confidence = max(p_class0, p_class1)
+            st.markdown("#### 🧾 Model output")
+            st.write(f"**Output count:** {len(output)}")
+            if len(output) == 1:
+                st.metric("Raw model output", f"{float(output[0]):.6f}")
+            else:
+                best_index = int(np.argmax(output))
+                st.metric("Highest-scoring output index", str(best_index))
+                st.metric("Highest raw score", f"{float(output[best_index]):.6f}")
+                for index, score in enumerate(output):
+                    st.write(f"**Output {index}:** {float(score):.6f}")
+                    # Progress is only a visual score indicator; do not call it a
+                    # probability unless the training code confirms that it is one.
+                    st.progress(float(np.clip(score, 0.0, 1.0)))
 
-            st.markdown("#### 🧾 Prediction result")
-            result_cols = st.columns(2)
-            result_cols[0].metric("Predicted CIMT Class", class_name)
-            result_cols[1].metric("Prediction confidence", f"{confidence:.1%}")
-            st.write(f"**Class 0 probability:** {p_class0:.1%}")
-            st.progress(p_class0)
-            st.write(f"**Class 1 probability:** {p_class1:.1%}")
-            st.progress(p_class1)
             st.caption(
-                "Research output only. It is not a direct CIMT measurement, "
-                "a heart-disease prediction, or a clinical diagnosis."
+                "Experimental model output only. These values are not a confirmed "
+                "clinical diagnosis. Interpret labels and scores using the training "
+                "configuration before treating them as age estimates or DR probabilities."
             )
         except Exception as error:
             st.error(
-                f"Image-only CIMT prediction failed: {type(error).__name__}: {error}"
+                f"Retina Age/DR prediction failed: {type(error).__name__}: {error}"
             )
 
 
@@ -810,8 +780,7 @@ for name, (filename, task) in MODEL_FILES.items():
 
 st.sidebar.subheader("Prediction Models")
 for name, path in [
-    ("Image-only CIMT Model", IMAGE_ONLY_CIMT_MODEL_PATH),
-    ("CIMT Evaluation Results", IMAGE_ONLY_CIMT_RESULTS_PATH),
+    ("Retina Age/DR Model", RETINA_AGE_DR_MODEL_PATH),
     ("Clinical CAD Model", CAD_MODEL_PATH),
 ]:
     if path.is_file():
@@ -966,14 +935,14 @@ if image is not None:
     ):
         show_retinal_results(st.session_state.retinal_results)
 
-    # Newly trained Keras image-only CIMT model is shown separately.
-    image_only_cimt_prediction_section(image)
+    # Saved Keras Retina Age/DR model is shown separately.
+    retina_age_dr_prediction_section(image)
 
     show_gradcam(image)
 
 else:
     st.info(
-        "Upload or capture a retinal image to run retinal analysis and the new image-only CIMT model. "
+        "Upload or capture a retinal image to run retinal analysis and the Retina Age/DR model. "
         "The clinical-only Heart Disease Model below works without an image."
     )
 
